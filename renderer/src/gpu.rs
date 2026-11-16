@@ -191,11 +191,85 @@ impl EditRoom {
     }
 }
 
-/// A procedural BLAS an edit made, to be built with the edit's TLAS (`Gpu::proc_blas`, `build_edit`).
+/// A procedural BLAS an edit made, to be built with its commit's TLAS (`Gpu::proc_blas`, `TopBuild`): kept by its
+/// blob's hash for reuse once built (`bytes`: its size).
 pub struct PendingProc {
+    hash: [u8; 32],
     blas: wgpu::Blas,
     boxes: wgpu::Buffer,
     size: wgpu::BlasAABBGeometrySizeDescriptor,
+    bytes: u64,
+}
+
+/// What a commit's edits leave to build above the triangles (live/edits.rs `commit`): each writes its data and notes
+/// here what is to build, and the commit builds once at its end (`Gpu::build_top`).
+#[derive(Default)]
+pub struct TopBuild {
+    /// Instances (hardware traversal's TLAS instances, software traversal's units) moved, came or went.
+    pub instances: bool,
+    /// The dynamic groups' BLASes: their triangles were re-transformed.
+    pub dynamic: bool,
+    /// Instanced meshes' BLASes: new meshes, a new shared pose.
+    pub meshes: Vec<u32>,
+    /// Procedural BLASes an edit made.
+    pub procs: Vec<PendingProc>,
+}
+
+impl TopBuild {
+    pub fn any(&self) -> bool {
+        self.instances || self.dynamic || !self.meshes.is_empty() || !self.procs.is_empty()
+    }
+}
+
+/// The build entries of instanced meshes' BLASes over their pool triangles as they are now.
+fn mesh_entries<'a>(accel: &'a Accel, meshes: &[u32]) -> Vec<wgpu::BlasBuildEntry<'a>> {
+    meshes
+        .iter()
+        .map(|&m| {
+            let (parts, sizes) = &accel.mesh_geo[m as usize];
+            wgpu::BlasBuildEntry {
+                blas: &accel.meshes[m as usize],
+                geometry: wgpu::BlasGeometries::TriangleGeometries(
+                    sizes
+                        .iter()
+                        .zip(parts)
+                        .map(|(size, &(first, _, _))| wgpu::BlasTriangleGeometry {
+                            size,
+                            vertex_buffer: &accel.verts,
+                            first_vertex: ((accel.pool_first + first as usize) * 3) as u32,
+                            vertex_stride: 12,
+                            index_buffer: None,
+                            first_index: None,
+                            transform_buffer: None,
+                            transform_buffer_offset: None,
+                        })
+                        .collect(),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// The build entries of the dynamic groups' BLASes (groups 4 and up) over their triangles as they are now.
+fn dynamic_entries(accel: &Accel) -> Vec<wgpu::BlasBuildEntry<'_>> {
+    accel
+        .blases
+        .iter()
+        .filter(|b| b.1 >= 4)
+        .map(|(blas, _, first, size)| wgpu::BlasBuildEntry {
+            blas,
+            geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
+                size,
+                vertex_buffer: &accel.verts,
+                first_vertex: (*first * 3) as u32,
+                vertex_stride: 12,
+                index_buffer: None,
+                first_index: None,
+                transform_buffer: None,
+                transform_buffer_offset: None,
+            }]),
+        })
+        .collect()
 }
 
 /// The acceleration structure's binding in the scene's group (trace_hw.wgsl `acc`): the last, after every buffer.
@@ -705,7 +779,7 @@ pub struct Accel {
     blases: Vec<(wgpu::Blas, usize, usize, wgpu::BlasTriangleGeometrySizeDescriptor)>,
     /// One per instanced mesh (model space), referenced by the TLAS's model instances.
     meshes: Vec<wgpu::Blas>,
-    /// Per mesh: its (first pool triangle, count, opaque) geometries and their sizes (`rebuild_meshes`).
+    /// Per mesh: its (first pool triangle, count, opaque) geometries and their sizes (`mesh_entries`).
     mesh_geo: Vec<(Vec<(u32, u32, bool)>, Vec<wgpu::BlasTriangleGeometrySizeDescriptor>)>,
     /// The first pool triangle in the GPU order.
     pool_first: usize,
@@ -3023,7 +3097,7 @@ impl Gpu {
     }
 
     /// A new instanced mesh over `count` triangles from GPU-order index `first` (in the edit room; live/edits.rs
-    /// `edit_geometry`), its first `opaque` ones opaque: its BLAS, which `rebuild_meshes` builds. Returns its index.
+    /// `edit_geometry`), its first `opaque` ones opaque: its BLAS, which the commit's build builds (`TopBuild::meshes`). Returns its index.
     pub fn add_mesh(&self, accel: &mut Accel, first: usize, count: u32, opaque: u32) -> u32 {
         // Built fast rather than traced fast (edits come every frame under destruction; the batches of pieces are rebuilt
         // every frame); THREERT_EDIT_BLAS=trace for the A/B (`mesh_blas_for`).
@@ -3038,34 +3112,22 @@ impl Gpu {
         &accel.meshes[k as usize]
     }
 
-    /// The AABB BLAS of a procedural geometry's boxes (live/edits.rs `edit_geometry`): the one kept by its hash or built
-    /// earlier in this edit (`fresh`), or a new one whose build goes into `e` and into `fresh`. The edit keeps `fresh`
-    /// (`keep_proc_blases`) only once `e` is submitted: an edit that falls back never submits, and a BLAS never built
-    /// must not be reused.
-    /// Its BLAS (kept by hash, or made now: its build added to `pending`, which `build_meshes` builds with the TLAS).
-    pub fn proc_blas(&self, blob: &crate::procasset::ProcBlob, pending: &mut Vec<PendingProc>, fresh: &mut Vec<([u8; 32], wgpu::Blas, u64)>) -> wgpu::Blas {
+    /// The AABB BLAS of a procedural geometry's boxes (live/edits.rs `edit_geometry`): the one kept by its hash, the
+    /// one this commit already made (`pending`), or a new one added to `pending` (`TopBuild::procs`).
+    pub fn proc_blas(&self, blob: &crate::procasset::ProcBlob, pending: &mut Vec<PendingProc>) -> wgpu::Blas {
         if let Some((blas, _)) = self.proc_blases.lock().unwrap().get(&blob.hash) {
             return blas.clone();
         }
-        if let Some((_, blas, _)) = fresh.iter().find(|f| f.0 == blob.hash) {
-            return blas.clone();
+        if let Some(p) = pending.iter().find(|p| p.hash == blob.hash) {
+            return p.blas.clone();
         }
         let d = &self.device;
         let size = wgpu::BlasAABBGeometrySizeDescriptor { primitive_count: (blob.boxes.len() / 6) as u32, flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE };
         let blas = d.create_blas(&wgpu::CreateBlasDescriptor { label: Some("proc"), flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE, update_mode: wgpu::AccelerationStructureUpdateMode::Build }, wgpu::BlasGeometrySizeDescriptors::AABBs { descriptors: vec![size.clone()] });
         let boxes = d.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("proc boxes"), contents: bytemuck::cast_slice(&blob.boxes), usage: wgpu::BufferUsages::BLAS_INPUT });
         let bytes = self.aabb_blas_bytes(&boxes, size.primitive_count).unwrap_or(0);
-        fresh.push((blob.hash, blas.clone(), bytes));
-        pending.push(PendingProc { blas: blas.clone(), boxes, size });
+        pending.push(PendingProc { hash: blob.hash, blas: blas.clone(), boxes, size, bytes });
         blas
-    }
-
-    /// Keeps the procedural BLASes an edit built (`proc_blas`), once its builds are submitted.
-    pub fn keep_proc_blases(&self, fresh: Vec<([u8; 32], wgpu::Blas, u64)>) {
-        let mut built = self.proc_blases.lock().unwrap();
-        for (hash, blas, bytes) in fresh {
-            built.insert(hash, (blas, bytes));
-        }
     }
 
     /// The scene's bind group (group 0: pathtrace.wgsl's declarations, the layout `Gpu::new` makes).
@@ -3161,7 +3223,7 @@ impl Gpu {
     }
 
     /// Software traversal's top tree again, over the units as they are now, written to its range of the node buffer
-    /// (what `rebuild_tlas` is to hardware traversal). Err: no tree can be made (more units than its range holds, a
+    /// (what the TLAS's build is to hardware traversal). Err: no tree can be made (more units than its range holds, a
     /// unit that is nowhere); nothing was written, and the caller rebuilds the scene.
     pub fn retop(&self, units: &mut crate::units::Units, nodes: &wgpu::Buffer) -> std::result::Result<(), String> {
         let top = units.top()?;
@@ -3183,74 +3245,39 @@ impl Gpu {
         self.queue.write_buffer(nodes, root as u64 * 32, bytemuck::cast_slice(&vec![crate::units::FILL; len as usize]));
     }
 
-    pub fn rebuild_tlas(&self, accel: &Accel, e: &mut wgpu::CommandEncoder) {
-        e.build_acceleration_structures(std::iter::empty::<&wgpu::BlasBuildEntry>(), [&accel.tlas]);
-    }
-
-    /// Rebuilds the BLASes of instanced meshes whose triangles changed (a new shared pose, `scene::PoseGroup`), not the
-    /// TLAS: the caller rebuilds it after (it holds their bounds).
-    pub fn rebuild_meshes(&self, accel: &Accel, meshes: &[u32], e: &mut wgpu::CommandEncoder) {
-        self.build_meshes(accel, meshes, e, false);
-    }
-
-    /// The BLASes of instanced meshes `meshes` and, with `tlas`, the TLAS in the same build (the TLAS reads the BLASes'
-    /// bounds through their resource ids, which Metal does not order a later build after: a TLAS built apart from a
-    /// BLAS it references, in the same encoder, could see it unbuilt and lose its instance; live/edits.rs `edit_geometry`).
-    pub fn build_meshes(&self, accel: &Accel, meshes: &[u32], e: &mut wgpu::CommandEncoder, tlas: bool) {
-        self.build_edit(accel, meshes, &[], e, tlas);
-    }
-
-    /// `build_meshes` with the procedural BLASes `proc_blas` left pending, all in the one build.
-    pub fn build_edit(&self, accel: &Accel, meshes: &[u32], procs: &[PendingProc], e: &mut wgpu::CommandEncoder, tlas: bool) {
-        let mut entries: Vec<wgpu::BlasBuildEntry> = meshes
-            .iter()
-            .map(|&m| {
-                let (parts, sizes) = &accel.mesh_geo[m as usize];
-                wgpu::BlasBuildEntry {
-                    blas: &accel.meshes[m as usize],
-                    geometry: wgpu::BlasGeometries::TriangleGeometries(
-                        sizes
-                            .iter()
-                            .zip(parts)
-                            .map(|(size, &(first, _, _))| wgpu::BlasTriangleGeometry {
-                                size,
-                                vertex_buffer: &accel.verts,
-                                first_vertex: ((accel.pool_first + first as usize) * 3) as u32,
-                                vertex_stride: 12,
-                                index_buffer: None,
-                                first_index: None,
-                                transform_buffer: None,
-                                transform_buffer_offset: None,
-                            })
-                            .collect(),
-                    ),
+    /// What a commit left to build above the triangles, once. Hardware traversal: the BLASes named and the TLAS in one
+    /// call: on Metal a TLAS built apart from a BLAS it references, in the next submit too, can see it unbuilt and
+    /// lose its instance until the TLAS is next built (tests/render/skinning-shared-pose-live). Software traversal:
+    /// the top tree over the units as they are now; Err: none can be made (`retop`), nothing was written, and the
+    /// caller rebuilds the scene.
+    pub fn build_top(&self, up: &mut Uploaded, b: TopBuild) -> std::result::Result<(), String> {
+        match Top::of(&mut up.accel, &mut up.units) {
+            Some(Top::Hw(accel)) => {
+                let mut meshes = b.meshes;
+                meshes.sort_unstable();
+                meshes.dedup();
+                let mut entries = mesh_entries(accel, &meshes);
+                entries.extend(b.procs.iter().map(|p| wgpu::BlasBuildEntry { blas: &p.blas, geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry { size: &p.size, stride: 24, aabb_buffer: &p.boxes, primitive_offset: 0 }]) }));
+                if b.dynamic {
+                    entries.extend(dynamic_entries(accel));
                 }
-            })
-            .collect();
-        entries.extend(procs.iter().map(|p| wgpu::BlasBuildEntry { blas: &p.blas, geometry: wgpu::BlasGeometries::AabbGeometries(vec![wgpu::BlasAabbGeometry { size: &p.size, stride: 24, aabb_buffer: &p.boxes, primitive_offset: 0 }]) }));
-        e.build_acceleration_structures(entries.iter(), tlas.then_some(&accel.tlas));
+                let mut e = self.device.create_command_encoder(&Default::default());
+                e.build_acceleration_structures(entries.iter(), [&accel.tlas]);
+                self.queue.submit([e.finish()]);
+                drop(entries);
+                // Built: kept for reuse (a commit that falls back never builds, and a BLAS never built must not be).
+                self.proc_blases.lock().unwrap().extend(b.procs.into_iter().map(|p| (p.hash, (p.blas, p.bytes))));
+                Ok(())
+            }
+            Some(Top::Sw(units)) => self.retop(units, &up.bg_parts.nodes),
+            None => Ok(()),
+        }
     }
 
+    /// The dynamic groups' BLASes and the TLAS, in a frame's encoder (the particle passes: their triangles are placed
+    /// by the GPU every frame).
     pub fn rebuild_dynamic(&self, accel: &Accel, e: &mut wgpu::CommandEncoder) {
-        let entries: Vec<wgpu::BlasBuildEntry> = accel
-            .blases
-            .iter()
-            .filter(|b| b.1 >= 4)
-            .map(|(blas, _, first, size)| wgpu::BlasBuildEntry {
-                blas,
-                geometry: wgpu::BlasGeometries::TriangleGeometries(vec![wgpu::BlasTriangleGeometry {
-                    size,
-                    vertex_buffer: &accel.verts,
-                    first_vertex: (*first * 3) as u32,
-                    vertex_stride: 12,
-                    index_buffer: None,
-                    first_index: None,
-                    transform_buffer: None,
-                    transform_buffer_offset: None,
-                }]),
-            })
-            .collect();
-        e.build_acceleration_structures(entries.iter(), [&accel.tlas]);
+        e.build_acceleration_structures(dynamic_entries(accel).iter(), [&accel.tlas]);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
