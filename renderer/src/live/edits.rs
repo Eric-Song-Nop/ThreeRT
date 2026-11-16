@@ -215,9 +215,7 @@ impl Grow<'_> {
     /// Whether buffers of these sizes (bytes) can be bound (the device's storage binding and buffer limits): past them
     /// the edit rebuilds instead (Bugbot on #131).
     pub(super) fn fits(&self, sizes: &[u64]) -> bool {
-        let l = self.g.device.limits();
-        let max = (l.max_storage_buffer_binding_size as u64).min(l.max_buffer_size);
-        sizes.iter().all(|&s| s <= max)
+        sizes.iter().all(|&s| self.g.buffer_fits(s))
     }
 
     /// Triangles: vertices, attributes, the BLASes' vertices, and in a scene with them (`colors`) vertex colours.
@@ -535,6 +533,12 @@ impl LiveCore {
                 self.g.set_medium(&self.sc.up, *id, None, Some(o.custom));
             }
         }
+        // Another sky, before the tables take the rest of the environment; one whose map cannot grow in place rebuilds.
+        if changes.sky && !changes.structural && !self.apply_sky(world)? {
+            self.fallback = Some("a sky whose map does not fit the scene's buffers in place".into());
+            self.fallbacks += 1;
+            changes.structural = true;
+        }
         let now = shader_time(self.time);
         let applied = self.sc.tables.apply(world, &changes, now).ok().flatten();
         let Some(d) = applied else {
@@ -619,17 +623,8 @@ impl LiveCore {
         let cover = self.sc.tables.cloud_cover;
         let colour = crate::sky::sun_illuminance(&sky.atm, dir, lux, cover);
         let e = &mut self.sc.tables;
-        if let (Some(idx), Some(o)) = (e.light_index.get(&id), world.objects.get(&id)) {
-            if let crate::world::Kind::Light(l) = &o.kind {
-                if let Some(mut gl) = scene::gpu_light(l, world.world_matrix(id), o.power) {
-                    // (The sun: hidden with a rebuild, `World::set_visible`.)
-                    gl.color = [colour.x, colour.y, colour.z, 0.0];
-                    for &i in idx {
-                        e.lights[i] = gl;
-                    }
-                    self.sc.up.put_lights(&self.g.queue, &e.lights);
-                }
-            }
+        if e.set_sun_light(world, id, colour) {
+            self.sc.up.put_lights(&self.g.queue, &e.lights);
         }
         let _ = sky.ask.send((dir, lux, cover));
         if self.fixed_dt.is_some() {
@@ -638,6 +633,46 @@ impl LiveCore {
             }
         }
         self.lit_changed = self.frame.max(1);
+    }
+
+    /// Another sky (its kind, its parameters, its sun), as a build takes it: baked here, its environment map and CDF
+    /// put in place (of another size: a new texture, the scene bound again), the parameters that say how it is read,
+    /// and the lights it owns: the atmosphere's sun takes its colour from the bake, a light that is the sun no longer
+    /// its own again. False, with nothing changed, when the map's CDF cannot grow in place (`Gpu::put_env`).
+    pub(super) fn apply_sky(&mut self, world: &World) -> Result<bool> {
+        let (sky, sun) = scene::sky_data(world, &self.assets, &|id| world.world_matrix(id))?;
+        let altitude = world.settings.camera.map_or(self.sc.sky_inputs.1, |id| world.world_matrix(id).w_axis.y.max(0.0));
+        let cover = world.environment.cloud_cover.clamp(0.0, 1.0);
+        let baked = crate::bake_sky(&sky, cover, altitude);
+        if !self.g.put_env(&mut self.sc.up, &baked.env, &crate::build_env_cdf(&baked.env)) {
+            return Ok(false);
+        }
+        let floor = self.sc.sky_inputs.2;
+        let b = &mut self.sc.base;
+        b.env = [if baked.has_env { 1.0 } else { 0.0 }, baked.env.width as f32, baked.env.height as f32, b.env[3]];
+        b.sky_color = [baked.color.x, baked.color.y, baked.color.z, 0.0];
+        b.counts2[1] = crate::sky_sampled(crate::sky_brightest(&baked.env, baked.color), floor, baked.has_env) as u32;
+        // The lights: what was the sun, and what is.
+        let e = &mut self.sc.tables;
+        let was = std::mem::replace(&mut e.retained.sun, sun);
+        let mut d = tables::Dirty::default();
+        if let Some(id) = was.filter(|id| Some(*id) != sun) {
+            e.update_light(world, id, &mut d);
+        }
+        // (Whole, not its colour alone: the tables no longer update a light that is the sun, and it may have been
+        // turned in this commit.)
+        if let (Some(id), Some(c)) = (sun, baked.sun) {
+            d.lights |= e.set_sun_light(world, id, c);
+        }
+        if d.lights && !e.lights.is_empty() {
+            self.sc.up.put_lights(&self.g.queue, &e.lights);
+        }
+        // (The worker that re-bakes a dynamic sky is this sky's no longer: the next move of the sun starts one.)
+        self.sc.sky = None;
+        self.sc.sky_inputs = ((baked.env.width, baked.env.height), altitude, floor);
+        self.sky_cover = cover;
+        self.lit_changed = self.frame.max(1);
+        Ok(true)
     }
 
     /// A sky the worker thread has baked since the last frame (the newest), into the environment map and its CDF.
@@ -654,7 +689,10 @@ impl LiveCore {
 
     pub(super) fn put_sky(&mut self, (env, cdf, max): (gpu::EnvMap, Vec<f32>, f32)) {
         let Some(sky) = self.sc.sky.as_ref() else { return };
-        self.g.write_env(&self.sc.up, &env, &cdf);
+        // (The worker bakes at the map's size: written in place.)
+        if !self.g.put_env(&mut self.sc.up, &env, &cdf) {
+            return;
+        }
         // As the load decides it: the sky is light-sampled unless it is negligible next to the emitters (night), or a
         // baked sky is not light-sampled at all (`env_nee_on`).
         self.sc.base.counts2[1] = (max >= sky.env_nee_floor && crate::env_nee_on()) as u32;
