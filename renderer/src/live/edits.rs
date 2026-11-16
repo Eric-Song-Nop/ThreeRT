@@ -360,8 +360,7 @@ impl LiveCore {
             if self.sc.tables.add_materials(world, &changes.new_materials) {
                 self.upload_materials();
                 // (A clear coat, an unlit material: the kernel variant with it, compiled once.)
-                let (e, (tex, func, groups)) = (&self.sc.tables, self.sc.fixed_features);
-                self.sc.up.kernel.features = gpu::features_of(&e.materials, e.fog.as_ref(), tex, func, groups, self.sc.instance_features) | if e.aerial[0] > 0.0 { gpu::F_AERIAL } else { 0 };
+                self.sc.up.kernel.features = self.sc.tables.features(self.sc.fixed_features, self.sc.instance_features);
             } else {
                 self.fallback = Some("a new material that cannot be added in place (it emits, is glass or a cutout)".into());
                 self.fallbacks += 1;
@@ -575,9 +574,8 @@ impl LiveCore {
             [b.fog, b.fog_color, b.vol, b.vol2] = crate::fog_params(e.fog.as_ref());
         }
         if d.materials || d.environment {
-            // e.g. fog appearing needs the fog kernel variant (compiled once, then cached)
-            let (tex, func, groups) = self.sc.fixed_features;
-            self.sc.up.kernel.features = gpu::features_of(&e.materials, e.fog.as_ref(), tex, func, groups, self.sc.instance_features) | if e.aerial[0] > 0.0 { gpu::F_AERIAL } else { 0 };
+            // (Fog or a background appearing, a clear coat: the kernel's variant with it, compiled once, then cached.)
+            self.sc.up.kernel.features = e.features(self.sc.fixed_features, self.sc.instance_features);
         }
         if let Some(c) = e.camera.take() {
             self.sc.scene_camera = Camera { pos: c.position, fwd: c.forward, up: c.up, right: c.right, tan_half_fov: c.tan_half_fov };
@@ -595,8 +593,15 @@ impl LiveCore {
             self.sky_cover = self.sc.tables.cloud_cover;
             self.move_sun(world);
         }
-        if changes.exposure {
+        if changes.settings {
+            self.apply_settings(world)?;
+            self.lit_changed = self.frame.max(1);
+        }
+        if changes.exposure || changes.settings {
             self.apply_exposure(world);
+        }
+        if changes.dof {
+            self.sc.dof = world.scene_camera().and_then(|c| c.dof.clone());
         }
         Ok(false)
     }
@@ -656,18 +661,26 @@ impl LiveCore {
         self.lit_changed = self.frame.max(1);
     }
 
-    /// The camera's manual exposure changed value (an exposure that follows the time of day), in place: the post pass's
-    /// exposure and the kernel's firefly clamp, which is relative to it.
+    /// The scene camera's exposure (its mode, its values) as a build takes it: what the frame is shown at, the auto
+    /// exposure's settings, and the kernel's firefly clamp, which is relative to it.
     pub(super) fn apply_exposure(&mut self, world: &World) {
-        let Some(cid) = world.settings.camera else { return };
-        let Some(crate::world::Kind::Camera(c)) = world.objects.get(&cid).map(|o| &o.kind) else { return };
-        let crate::desc::Exposure::Manual { ev100 } = c.exposure else { return };
-        let e = 2f32.powf(-ev100);
-        if self.sc.exposure > 0.0 {
-            self.sc.base.misc[0] *= self.sc.exposure / e;
-        }
-        self.sc.exposure = e;
-        self.sc.exposure_settings.ae2 = [e, 0.0, 0.0, 0.0];
+        let Some(c) = world.scene_camera() else { return };
+        self.sc.base.misc[0] = self.sc.preset.native.firefly_clamp(&c.exposure);
+        self.sc.exposure = c.exposure.start();
+        self.sc.exposure_settings = ExposureSettings::new(&c.exposure, &self.sc.preset.post);
+    }
+
+    /// The preset, its overrides or the scene's name changed: the kernel parameters a build takes from the preset
+    /// (bounces, Russian roulette, energy compensation) and the post passes'. (What the preset says of the exposure:
+    /// `apply_exposure`, after it.)
+    pub(super) fn apply_settings(&mut self, world: &World) -> Result<()> {
+        let preset = scene::preset_of(world, &self.presets, None)?;
+        let b = &mut self.sc.base;
+        (b.counts[2], b.counts[3], b.misc[2]) = (preset.native.max_bounces, preset.native.russian_roulette_depth, preset.native.energy_compensation);
+        self.apply_post(&preset.post);
+        self.sc.preset = preset;
+        self.scene_name = world.settings.name.clone();
+        Ok(())
     }
 
     /// Moves movable instances: their kernel records (the old transform kept as the previous frame's, for motion
