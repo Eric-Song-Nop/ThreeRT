@@ -684,11 +684,17 @@ pub fn prepare_as(hwrt: bool, units: bool, sc: &mut scene::Scene, timings: &mut 
             emitter_tris.push(e);
         }
     }
-    // (A mesh that emits: its triangles numbered as they lie here, for its instances' emitters.)
+    // (A mesh that emits: its emitting triangles numbered as they lie here, for its instances' emitters.)
     for m in sc.meshes.iter().filter(|m| m.emitters > 0) {
-        scene::number_emitters(&mut sc.attrs[pool_first + m.first as usize..pool_first + (m.first + m.count) as usize]);
+        let n = scene::number_emitters(&mut sc.attrs[pool_first + m.first as usize..pool_first + (m.first + m.count) as usize], &sc.materials);
+        assert_eq!(n, m.emitters, "a mesh's emitters as the build counted them");
     }
-    let moving: std::collections::HashSet<u32> = sc.retained.proxies.values().filter_map(|p| match &p.draw { scene::Draw::Instance(i) if i.moves => Some(i.instance), _ => None }).collect();
+    // (The instances an edit moves in place: a body's, a movable model's, a posed rigid model's nodes'.)
+    let moving: std::collections::HashSet<u32> = sc.retained.proxies.values().flat_map(|p| match &p.draw {
+        scene::Draw::Instance(i) if i.moves => vec![i.instance],
+        scene::Draw::Rigid(r) => r.instances.iter().map(|&(_, i)| i).collect(),
+        _ => vec![],
+    }).collect();
     for r in 0..sc.instances.len() {
         let m = sc.meshes[sc.instances[r].mesh as usize];
         if m.emitters == 0 {
@@ -916,7 +922,7 @@ fn flatten_instances(sc: &mut scene::Scene) {
             sc.tri_flags.push(scene::instance_tri_flags(&inst, &sc.pool_attrs[k as usize], &sc.materials));
             sc.attrs.push(scene::instance_attr(&sc.pool_attrs[k as usize], inst.world, inst.object));
         }
-        // A second range for the node when its glass / emissive part was flattened at build: node_tris joins them.
+        // A second range for the node when its glass / function part was flattened at build: node_tris joins them.
         sc.tri_nodes.push((inst.name, first, sc.tris.len() as u32));
         if let Some(i) = inst.sub {
             sc.tri_instances.push((first, sc.tris.len() as u32, i));
