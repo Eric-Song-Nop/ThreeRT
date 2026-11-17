@@ -239,7 +239,7 @@ impl LightTree {
         self.checked();
     }
 
-    /// The moving emitters moved: their leaves' spheres from their triangles now (`verts(k)`: entry k's vertices),
+    /// The moving emitters moved: their leaves' spheres from their triangles now (`verts(e)`: emitter e's vertices),
     /// then each moving node's and the root's from its children's, bottom-up (children come after their parent). The
     /// topology, codes and powers stay.
     pub fn refit_moving(&mut self, verts: &dyn Fn(usize) -> [[f32; 3]; 3]) {
@@ -252,7 +252,7 @@ impl LightTree {
                 let (a, b) = self.ranges[i];
                 let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
                 for k in a..b {
-                    let (l, h) = bounds(&verts(k as usize));
+                    let (l, h) = bounds(&verts(self.order[k as usize] as usize));
                     for j in 0..3 {
                         lo[j] = lo[j].min(l[j]);
                         hi[j] = hi[j].max(h[j]);
@@ -536,13 +536,15 @@ mod tests {
     #[test]
     fn moving_emitters_get_a_subtree_that_refits() {
         let n = 400u32;
-        let (mut tris, verts): (Vec<EmitterTri>, Vec<[[f32; 4]; 3]>) = (0..n).map(|i| tri(i, i as f32 * 2.0)).unzip();
+        // (The movers are not along x in the list's order: their leaf order is another, so an entry is not its emitter.)
+        let (mut tris, verts): (Vec<EmitterTri>, Vec<[[f32; 4]; 3]>) = (0..n).map(|i| tri(i, if i < 300 { i as f32 * 2.0 } else { 600.0 + (i * 37 % 100) as f32 * 2.0 })).unzip();
         for t in tris.iter_mut().skip(300) {
             t.moves = true;
         }
         let verts: Vec<[f32; 4]> = verts.into_iter().flatten().collect();
         let mut t = build(&tris, &verts, &|_| 1.0).unwrap();
         assert_eq!((t.moving_first, t.moving_count), (300, 100));
+        assert!((300..400).any(|k| t.order[k] != k as u32), "the movers' leaf order is not the list's");
         assert!((t.power - n as f32).abs() < 1e-3);
         for k in 0..n as usize {
             let moving = tris[t.order[k] as usize].moves;
@@ -551,20 +553,16 @@ mod tests {
         }
         // The moving ones move 50 m up: every leaf and its ancestors hold them there.
         let codes = t.code.clone();
-        let moved = |k: usize| {
-            let i = t.order[k] as usize * 3;
-            tri_vertices(&verts[i..i + 3]).map(|v| [v[0], v[1] + 50.0, v[2]])
-        };
-        let order = t.order.clone();
-        let vs: Vec<[[f32; 3]; 3]> = (0..n as usize).map(|k| if tris[order[k] as usize].moves { moved(k) } else { [[0.0; 3]; 3] }).collect();
-        t.refit_moving(&|k| vs[k]);
+        let moved = |e: usize| tri_vertices(&verts[e * 3..e * 3 + 3]).map(|v| [v[0], v[1] + 50.0, v[2]]);
+        let vs: Vec<[[f32; 3]; 3]> = (0..n as usize).map(|e| if tris[e].moves { moved(e) } else { [[0.0; 3]; 3] }).collect();
+        t.refit_moving(&|e| vs[e]);
         assert_eq!(t.code, codes);
         for k in t.moving_first as usize..n as usize {
             let mut node = 0usize;
             let depth = (t.code[k] >> PATH_BITS) - 1;
             for l in 0..=depth {
                 let (c, r) = sphere_of(&t.nodes[node]);
-                for v in vs[k] {
+                for v in vs[t.order[k] as usize] {
                     let d = ((v[0] - c[0]).powi(2) + (v[1] - c[1]).powi(2) + (v[2] - c[2]).powi(2)).sqrt();
                     assert!(d <= r * 1.001 + 1e-3, "entry {k} outside node {node} at level {l}: {d} > {r}");
                 }
