@@ -110,12 +110,16 @@ impl Tables {
             let o = w.objects.get(id).ok_or_else(|| anyhow!("unknown object {id}"))?;
             if let Some(oi) = self.retained.object(*id) {
                 let row = oi as usize * self.stride;
+                // (The row of a mesh or a model that is hidden, or placed without size, has no power: its instance's emitters at
+                // no weight until it comes back.)
+                let unseen = matches!(o.kind, Kind::Mesh { .. } | Kind::Model { .. }) && (!w.shown(*id) || scene::placed_world(w.world_matrix(*id), glam::Vec3::ZERO).1);
+                let power = if unseen { 0.0 } else { o.power.max(0.0) };
                 if self.defer_powers {
                     self.deferred.retain(|p| p.0 != row);
-                    self.deferred.push((row, o.power.max(0.0), now));
+                    self.deferred.push((row, power, now));
                     d.deferred = true;
                 } else {
-                    self.put_powers(&[(row, o.power.max(0.0), now)]);
+                    self.put_powers(&[(row, power, now)]);
                     d.objects = true;
                     d.emitters = true;
                 }
