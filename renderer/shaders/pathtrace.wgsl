@@ -89,6 +89,7 @@ const F_UNLIT: u32 = 1048576u; // MeshBasicMaterial (MAT_UNLIT)
 const F_BACKGROUND: u32 = 2097152u; // scene.background (`sky_mis`)
 const F_VCOLOR: u32 = 4194304u; // vertex colours (`vcolor`)
 const F_GRID: u32 = 33554432u; // density grids (`vgrid`)
+const F_IFUNC: u32 = 268435456u; // a material function on an instanced mesh: `mat_in_at` places the triangle by its instance
 const F_LISTS: u32 = 134217728u; // light tiles (`lt_list_start`): a scene whose shadow-casting local lights are resampled
 fn has(f: u32) -> bool { return (FEAT & f) != 0u; }
 
@@ -279,6 +280,10 @@ fn vcolor(t: u32, u: f32, v: f32) -> vec3<f32> {
 
 
 fn inst_vec(r: Instance, v: vec3<f32>) -> vec3<f32> { return vec3<f32>(dot(r.m0.xyz, v), dot(r.m1.xyz, v), dot(r.m2.xyz, v)); }
+// An instance that mirrors its mesh (scene.rs `INST_MIRRORED`, a bit of the record's n1.w): -1, else 1. The placed
+// edges' cross product then points to the mesh's inner side, and the tangent frame changes hand.
+const INST_MIRRORED: u32 = 4u;
+fn inst_sign(r: Instance) -> f32 { return select(1.0, -1.0, (bitcast<u32>(r.n1.w) & INST_MIRRORED) != 0u); }
 fn inst_normal(r: Instance, n: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(normalize(vec3<f32>(dot(r.n0.xyz, n.xyz), dot(r.n1.xyz, n.xyz), dot(r.n2.xyz, n.xyz))), n.w);
 }
@@ -293,7 +298,7 @@ fn inst_attr(r: Instance, a: TriAttr) -> TriAttr {
     b.n0 = inst_normal(r, a.n0);
     b.n1 = inst_normal(r, a.n1);
     b.n2 = inst_normal(r, a.n2);
-    b.t = vec4<f32>(normalize(inst_vec(r, a.t.xyz)), a.t.w);
+    b.t = vec4<f32>(normalize(inst_vec(r, a.t.xyz)), a.t.w * inst_sign(r));
     b.x = inst_x(r.info, a.x);
     return b;
 }
@@ -1134,12 +1139,26 @@ fn obj_tint(oi: u32) -> vec3<f32> { return object_at(oi * OBJECT_STRIDE + 3u).rg
 fn obj_power(a: TriAttr) -> f32 { return object_at(object_of(a) * OBJECT_STRIDE).w; }
 
 // Inputs at a point of triangle ti (barycentrics u, v) for material functions outside full shading (alpha, NEE).
-fn mat_in_at(ti: u32, u: f32, v: f32, view: vec3<f32>, lod: f32) -> MatIn {
-    let a = attrs[ti];
+// `inst`: the instance a mesh's triangle is placed by (as `surface` places it), or NO_INST. (By F_IFUNC, not by
+// F_INST: where no instanced mesh has a function the placement is not compiled in.)
+fn mat_in_at(ti: u32, inst: u32, u: f32, v: f32, view: vec3<f32>, lod: f32) -> MatIn {
+    var a = attrs[ti];
+    var v0 = tri_verts[ti * 3u].xyz;
+    var e1 = tri_verts[ti * 3u + 1u].xyz;
+    var e2 = tri_verts[ti * 3u + 2u].xyz;
+    var side = 1.0;
+    if (has(F_IFUNC) && inst != NO_INST) {
+        let r = instance_at(inst);
+        v0 = inst_vec(r, v0) + vec3<f32>(r.m0.w, r.m1.w, r.m2.w);
+        e1 = inst_vec(r, e1);
+        e2 = inst_vec(r, e2);
+        a = inst_attr(r, a);
+        side = inst_sign(r);
+    }
     let m = material_at(bitcast<u32>(a.uv.w));
     let w = 1.0 - u - v;
-    let p = tri_verts[ti * 3u].xyz + tri_verts[ti * 3u + 1u].xyz * u + tri_verts[ti * 3u + 2u].xyz * v;
-    let ng = normalize(cross(tri_verts[ti * 3u + 1u].xyz, tri_verts[ti * 3u + 2u].xyz));
+    let p = v0 + e1 * u + e2 * v;
+    let ng = normalize(cross(e1, e2)) * side;
     var n = normalize(a.n0.xyz * w + a.n1.xyz * u + a.n2.xyz * v);
     let t = normalize(a.t.xyz - n * dot(n, a.t.xyz) + vec3<f32>(1e-9));
     let oi = object_of(a);
@@ -1189,7 +1208,7 @@ fn alpha_pass(ti: u32, inst: u32, u: f32, v: f32, t: f32) -> bool {
         alpha *= tex(m.tex0.x, mesh_uv(a, m, u, v), lod).a;
     }
     if (has(F_FUNC) && m.tex1.w > 0) {
-        let i = mat_in_at(ti, u, v, vec3<f32>(0.0, 1.0, 0.0), log2(max(t * 2.0 * P.cam_pos.w / lod_height(), 1e-7)));
+        let i = mat_in_at(ti, inst, u, v, vec3<f32>(0.0, 1.0, 0.0), log2(max(t * 2.0 * P.cam_pos.w / lod_height(), 1e-7)));
         var b = mat_base(m);
         b.opacity = alpha;
         alpha = alpha_material_function(m.tex1.w - 1, i, m, b).opacity;
@@ -1212,14 +1231,16 @@ fn surface(o: vec3<f32>, d: vec3<f32>, h: Hit, width: f32) -> Surface {
     var e1 = tri_verts[i * 3u + 1u].xyz;
     var e2 = tri_verts[i * 3u + 2u].xyz;
     var a = attrs[i];
+    var side = 1.0;
     if (has(F_INST) && h.inst != NO_INST) {
         let r = instance_at(h.inst);
         e1 = inst_vec(r, e1);
         e2 = inst_vec(r, e2);
         a = inst_attr(r, a);
+        side = inst_sign(r);
     }
     let w = 1.0 - h.u - h.v;
-    var ng = normalize(cross(e1, e2));
+    var ng = normalize(cross(e1, e2)) * side;
     var n = normalize(a.n0.xyz * w + a.n1.xyz * h.u + a.n2.xyz * h.v);
     let mi = bitcast<u32>(a.uv.w);
     let m = material_at(mi);
@@ -2096,7 +2117,7 @@ fn emitter_radiance(em: EmitterTri, b1: f32, b2: f32, l: vec3<f32>) -> vec3<f32>
     if (has(F_FUNC) && m.tex1.w > 0) {
         var mb = mat_base(m);
         mb.emissive *= pw;
-        le = emissive_material_function(m.tex1.w - 1, mat_in_at(em.tri, b1, b2, -l, log2(0.05)), m, mb).emissive;
+        le = emissive_material_function(m.tex1.w - 1, mat_in_at(em.tri, em.inst, b1, b2, -l, log2(0.05)), m, mb).emissive;
     }
     return le;
 }
