@@ -44,6 +44,7 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 pub struct ViewArgs {
+    pub reconstruction: Option<crate::live::Reconstruction>,
     /// Game bundle to run in-process.
     pub bundle: PathBuf,
     /// Asset root the scene's model / texture paths resolve against.
@@ -235,6 +236,7 @@ impl App {
             eprintln!("view: the game reads input (pointer: {p}){}", if p == "look" { ": click to capture the pointer, Esc lets go" } else { "" });
         }
         core.bounces = a.bounces;
+        if let Some(mode) = a.reconstruction { core.set_reconstruction(mode); }
         core.set_scale(a.scale.unwrap_or(0.0));
         core.set_display_scale(window.scale_factor() as f32);
         let d = &core.g.device;
@@ -593,6 +595,7 @@ fn frame(s: &mut State, cmds: &mpsc::Receiver<Cmd>, services: &mut dyn HostServi
                 s.core.bounces = b;
             }
             Cmd::SppCap(n) => s.spp_cap = n,
+            Cmd::Reconstruction(v) => s.core.set_reconstruction(v),
             Cmd::Scale(v) => s.core.set_scale(v),
             Cmd::Resize(w, h) => {
                 // The window's size; the view follows it (`fit`).
@@ -838,6 +841,7 @@ pub fn parse_args(args: &[String], presets: &Path) -> Result<ViewArgs> {
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let num = |name: &str, d: u32| flag(name).and_then(|v| v.parse().ok()).unwrap_or(d);
     Ok(ViewArgs {
+        reconstruction: flag("--reconstruction").map(|v| crate::live::Reconstruction::parse(&v)).transpose()?,
         bundle: PathBuf::from(args.get(2).filter(|a| !a.starts_with("--")).ok_or_else(|| anyhow::anyhow!("game bundle required"))?),
         assets: PathBuf::from(flag("--assets").unwrap_or_else(|| ".".into())),
         room: flag("--room").unwrap_or_else(|| "local".into()),

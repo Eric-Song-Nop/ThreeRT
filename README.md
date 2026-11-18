@@ -156,6 +156,10 @@ node tools/three/open.ts scenes/bistro.ts # the same scene in three.js, in your 
 
 In the window: drag to orbit, right-drag to pan, wheel to zoom, WASD/QE to fly, `R` to reset, `P` for a snapshot.
 
+On macOS, `play` and `live` accept `--reconstruction metalfx` for temporal upscaling or
+`--reconstruction metalfx-denoised` for joint ray-tracing denoising and upscaling.
+See [live reconstruction modes and hardware support](docs/RUNTIME.md#live-reconstruction-on-macos).
+
 ```bash
 npm test && npm run typecheck && (cd renderer && cargo test --release)   # scene API, gameplay, runtime and engine tests
 npm run test:render                                                      # the render test suite, on the GPU

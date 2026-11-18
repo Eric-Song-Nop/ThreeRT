@@ -41,6 +41,7 @@ struct Job {
     hdr: Option<PathBuf>,
     /// A live job's approximations (`gpu::A_*` bits; None: the device's).
     approx: Option<u32>,
+    reconstruction: Option<live::Reconstruction>,
     /// `--signals PREFIX`: PREFIX-diffuse.raw / -specular.raw / -emission.raw, the image's linear signals apart as the
     /// live denoiser splits them (RGB f32, output size; live snapshots to `*.signals` write the same).
     signals: Option<PathBuf>,
@@ -179,6 +180,7 @@ fn main() -> Result<()> {
                 size: (flag("--width").map(|s| s.parse()).transpose()?, flag("--height").map(|s| s.parse()).transpose()?),
                 hdr: flag("--hdr").map(PathBuf::from),
                 approx: None,
+                reconstruction: None,
                 signals: flag("--signals").map(PathBuf::from),
             };
             let stats = render(&g, &job, &presets, init_ms, &mut Hosts::default())?;
@@ -340,6 +342,7 @@ fn main() -> Result<()> {
                         time: v["time"].as_f64().map(|t| t as f32),
                         size: (v["width"].as_u64().map(|x| x as u32), v["height"].as_u64().map(|x| x as u32)),
                         hdr: v["hdr"].as_str().map(PathBuf::from),
+                        reconstruction: v["reconstruction"].as_str().map(live::Reconstruction::parse).transpose()?,
                         approx: v["approx"].as_u64().map(|x| x as u32),
                         signals: v["signals"].as_str().map(PathBuf::from),
                     };
@@ -395,6 +398,7 @@ fn render_live(slot: &mut Option<gpu::Gpu>, job: &Job, presets: &Path, frames: u
     };
     g.set_approx(job.approx);
     let mut core = live::LiveCore::new(g, &w, &job.game.assets, presets, width, height)?;
+    if let Some(mode) = job.reconstruction { core.set_reconstruction(mode); }
     core.set_scale(1.0);
     drop(w);
     // A frame script runs at 60 fps: the renderer's frame time is the same (motion blur, exposure adaptation).
@@ -423,8 +427,9 @@ fn render_live(slot: &mut Option<gpu::Gpu>, job: &Job, presets: &Path, frames: u
     }
     let ev100 = core.read_ev100()?;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let reconstruction = core.reconstruction().name();
     *slot = Some(core.g);
-    Ok(serde_json::json!({ "width": width, "height": height, "frames": frames, "ev100": ev100, "timings_ms": { "total_ms": ms } }))
+    Ok(serde_json::json!({ "width": width, "height": height, "frames": frames, "reconstruction": reconstruction, "ev100": ev100, "timings_ms": { "total_ms": ms } }))
 }
 
 /// PREFIX-diffuse.raw, -specular.raw, -emission.raw (RGB f32 each).

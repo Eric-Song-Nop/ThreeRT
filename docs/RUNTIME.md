@@ -1600,6 +1600,42 @@ none of them it traces its light there. Two limits are known and held by tests s
   sunlit mirror wall 5 % bright), and a surface seen in a reflection takes the sky's light from it, unshadowed
   below a voxel's size.
 
+## Live reconstruction on macOS
+
+The `play` window and headless `live` renderer share the same reconstruction path. From the repository root:
+
+```sh
+node tools/bundle-game.ts scenes/neon-reflections.ts
+cargo run --release --manifest-path renderer/Cargo.toml --bin threert-render -- \
+  play out/bundles/neon-reflections.js --scale 0.5 --reconstruction metalfx-denoised
+```
+
+| `--reconstruction` | Live HDR pipeline |
+|---|---|
+| `builtin` (default) | ThreeRT's diffuse and specular denoisers, reflection resolve and temporal upscaler |
+| `metalfx` | ThreeRT's denoisers and reflection resolve, followed by Apple's temporal upscaler |
+| `metalfx-denoised` | Apple's joint denoising and upscaling of noisy path-traced radiance |
+| `auto` | Tries the denoised scaler, the temporal scaler, then the built-in implementation, in that order |
+
+The temporal scaler requires a supporting Metal device and macOS 13 or later. Build with the macOS 26 SDK
+or newer to include the denoised scaler, which also requires macOS 26 or newer at runtime. The engine checks
+the device and requested dimensions when it creates either scaler. An unavailable selection falls back to
+`builtin`. Diagnostic views use the built-in passes. A plain temporal scaler can keep its history across
+dynamic resolution changes inside the supported range. The denoised scaler starts a new history when its
+input dimensions change.
+
+Both scalers receive scene-linear HDR, reverse-Z depth, camera and object motion, subpixel jitter and a reactive
+mask on systems that support it. The denoised scaler also receives world-space shading normals, diffuse and
+specular reflectance, roughness, a denoising mask and specular hit distance. For smooth mirrors and glass,
+secondary ray queries add the reflected and transmitted surfaces to the material guides. Exposure, bloom,
+depth of field and motion blur process the reconstructed HDR image on the GPU.
+
+Set `THREERT_RECONSTRUCTION` for a native process that embeds `LiveCore`, or call
+`LiveCore::set_reconstruction` from Rust. The command-line flag overrides the environment.
+Send `{"cmd":"reconstruction","mode":"metalfx"}` to switch a running `live` or `play` session.
+Snapshot metadata reports both `requested_reconstruction` and the active `reconstruction`.
+The `live --frame-log` JSON lines also record the active implementation.
+
 ## Moving objects in the live view
 
 The live view's histories (the irradiance and specular ones on the traced grid, the upscaler's colour on the output

@@ -50,6 +50,8 @@ use web_time::Instant;
 mod edits;
 mod frame;
 mod layout;
+#[cfg(target_os = "macos")]
+mod metalfx;
 mod load;
 #[cfg(not(target_arch = "wasm32"))]
 mod session;
@@ -66,7 +68,36 @@ use load::*;
 use state::*;
 use targets::*;
 
+/// Reconstruction of the live HDR image. Auto tries the denoised scaler, then temporal, then WGSL.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Reconstruction {
+    #[default]
+    Builtin,
+    Auto,
+    Temporal,
+    Denoised,
+}
+impl Reconstruction {
+    pub fn name(self) -> &'static str {
+        match self { Self::Builtin => "builtin", Self::Auto => "auto", Self::Temporal => "metalfx", Self::Denoised => "metalfx-denoised" }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "builtin" => Ok(Self::Builtin), "auto" => Ok(Self::Auto),
+            "metalfx" => Ok(Self::Temporal), "metalfx-denoised" => Ok(Self::Denoised),
+            _ => anyhow::bail!("unknown reconstruction '{s}'; use builtin, auto, metalfx or metalfx-denoised"),
+        }
+    }
+    fn skips(self, pass: &str) -> bool {
+        if self == Self::Builtin { return false; }
+        matches!(pass, "lock_carry" | "track" | "judge" | "reject" | "upscale")
+            || self == Self::Denoised && (matches!(pass, "refl" | "dtemporal" | "stemporal") || pass.starts_with("atrous") || pass.starts_with("sfilt"))
+    }
+}
+
 pub struct LiveOpts {
+    pub reconstruction: Option<Reconstruction>,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -215,6 +246,7 @@ pub enum Cmd {
     Status(String),
     /// Render scale (0 = dynamic resolution).
     Scale(f32),
+    Reconstruction(Reconstruction),
     /// The view at another size, pixels (`LiveCore::resize`; the window host: its window's).
     Resize(u32, u32),
     Quit,
@@ -223,6 +255,10 @@ pub enum Cmd {
 /// The real-time renderer: scene + screen targets + camera/history state. Records one frame at a time; the output
 /// (sRGB BGRA8 per pixel) lands in `targets.out`. Used by the headless runner, the native window viewer and the playground.
 pub struct LiveCore {
+    requested_reconstruction: Reconstruction,
+    active_reconstruction: Reconstruction,
+    #[cfg(target_os = "macos")]
+    metalfx: metalfx::MetalFx,
     /// The game's particle spawns since the last frame (`World::particle_spawns`), for the GPU particle pass.
     particle_spawns: std::collections::BTreeMap<u32, Vec<f32>>,
     /// The sources the game gave its density grids since the last frame (`World::grid_sources`), for the grid pass.
@@ -538,11 +574,29 @@ impl LiveCore {
         // brings it, `gpu::loop_guard_of`.)
         let guard_read = (gpu::loop_guard_of(!g.hwrt).is_some() && targets.kernel.guard.is_some())
             .then(|| (g.device.create_buffer(&wgpu::BufferDescriptor { label: Some("loop guard read"), size: 4, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }), Arc::new(AtomicU32::new(0))));
-        let mut core = LiveCore { top_builds: 0, particle_spawns: Default::default(), grid_sources: Default::default(), g, passes, targets, sc, view, env, presets: presets.to_path_buf(), assets: assets.to_path_buf(), w, h, seq: 0, aspect: w as f32 / h as f32, cam, prev_cam: cam, frame: 0, history_len: 0.0, reset: true, bloom: ([0.0; 6], [0.0; 6]), vignette: 0.0, post: [0.0; 4], blur: (0.0, 0.0), inflight: Default::default(), gpu_ms: 0.0, gpu_frame: 0, gpu_trace_ms: 0.0, edit_ms: 0.0, instanced_ms: 0.0, build_ms: 0.0, edit_split: EditSplit::default(), rebuild_ms: 0.0, fallback: None, fallbacks: 0, bounces: 4, rays: true, view_mode: std::env::var("THREERT_VIEW_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), fixed_dt: None, motion_blur_off: false, triangles, scene_name, time: 0.0, frame_dt: 1.0 / 60.0, last_frame: Instant::now(), post_key: String::new(), render_scale: 1.0, dynamic_res: false, min_scale: MIN_SCALE, display_scale: 1.0, over_budget: (0, 0), born: Instant::now(), governed: Instant::now(), profile, timer, raster, cache, kernel_bg, tl_kernel_bg, prev_span: None, reposed: false, emitters_moved: false, emitters_reweigh: false,  pose_span: None, pose_reposed: false, inst_moving: vec![], inst_moved: false, prev_isz: (0, 0), light_tiles: None, lit_changed: 0, spark_lights: false, shown_spp: 1, cpu_skin_ms: 0.0, cpu_upload_ms: 0.0, gpu_blas_ms: 0.0, cpu_wait_ms: 0.0, guard_trips: guard_read.as_ref().map(|_| 0), guard_read };
+        let mut core = LiveCore {
+            #[cfg(target_os = "macos")]
+            metalfx: Default::default(),
+            requested_reconstruction: {
+                #[cfg(not(target_arch = "wasm32"))]
+                { std::env::var("THREERT_RECONSTRUCTION").ok().map(|s| Reconstruction::parse(&s)).transpose()?.unwrap_or_default() }
+                #[cfg(target_arch = "wasm32")]
+                { Reconstruction::Builtin }
+            },
+            active_reconstruction: Reconstruction::Builtin, top_builds: 0, particle_spawns: Default::default(), grid_sources: Default::default(), g, passes, targets, sc, view, env, presets: presets.to_path_buf(), assets: assets.to_path_buf(), w, h, seq: 0, aspect: w as f32 / h as f32, cam, prev_cam: cam, frame: 0, history_len: 0.0, reset: true, bloom: ([0.0; 6], [0.0; 6]), vignette: 0.0, post: [0.0; 4], blur: (0.0, 0.0), inflight: Default::default(), gpu_ms: 0.0, gpu_frame: 0, gpu_trace_ms: 0.0, edit_ms: 0.0, instanced_ms: 0.0, build_ms: 0.0, edit_split: EditSplit::default(), rebuild_ms: 0.0, fallback: None, fallbacks: 0, bounces: 4, rays: true, view_mode: std::env::var("THREERT_VIEW_MODE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), fixed_dt: None, motion_blur_off: false, triangles, scene_name, time: 0.0, frame_dt: 1.0 / 60.0, last_frame: Instant::now(), post_key: String::new(), render_scale: 1.0, dynamic_res: false, min_scale: MIN_SCALE, display_scale: 1.0, over_budget: (0, 0), born: Instant::now(), governed: Instant::now(), profile, timer, raster, cache, kernel_bg, tl_kernel_bg, prev_span: None, reposed: false, emitters_moved: false, emitters_reweigh: false,  pose_span: None, pose_reposed: false, inst_moving: vec![], inst_moved: false, prev_isz: (0, 0), light_tiles: None, lit_changed: 0, spark_lights: false, shown_spp: 1, cpu_skin_ms: 0.0, cpu_upload_ms: 0.0, gpu_blas_ms: 0.0, cpu_wait_ms: 0.0, guard_trips: guard_read.as_ref().map(|_| 0), guard_read };
         core.spark_lights = core.sc.tables.emitter_tris.iter().any(|e| e.nominal);
         core.apply_post();
         Ok(core)
     }
+
+    pub fn set_reconstruction(&mut self, mode: Reconstruction) {
+        if self.requested_reconstruction != mode {
+            self.requested_reconstruction = mode;
+            self.reset_history();
+        }
+    }
+
+    pub fn reconstruction(&self) -> Reconstruction { self.active_reconstruction }
 
     pub fn scene_camera(&self) -> Camera {
         self.view.camera
@@ -737,6 +791,8 @@ impl LiveCore {
             anyhow::bail!("a view of {w} x {h}: more samples than this device holds in one buffer");
         }
         (self.w, self.h, self.aspect) = (w, h, w as f32 / h as f32);
+        #[cfg(target_os = "macos")]
+        self.metalfx.invalidate();
         self.targets.resize(&self.g, &self.passes, w, h);
         if self.raster.is_some() {
             self.raster = Some(Raster::new(&self.g, w, h));
@@ -1011,6 +1067,7 @@ impl LiveCore {
         let c = &self.cam;
         serde_json::json!({
             "seq": self.seq, "frame": self.frame, "history": self.history_len, "gpu_ms": self.gpu_ms,
+            "reconstruction": self.active_reconstruction.name(), "requested_reconstruction": self.requested_reconstruction.name(),
             "scene": self.scene_name, "triangles": self.triangles, "bounces": self.bounces, "mode": self.view_mode, "width": self.w, "height": self.h, "scale": self.render_scale,
             "cam": { "pos": c.pos.to_array(), "fwd": c.fwd.to_array(), "up": c.up.to_array(), "right": c.right.to_array(), "tan": c.tan_half_fov, "aspect": self.aspect },
         })

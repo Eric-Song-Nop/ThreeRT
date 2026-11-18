@@ -868,3 +868,47 @@ fn the_light_list_holds_its_triangles() {
         assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
     }
 }
+
+/// A thin, bright panel in scene-linear units. Catches clipping of HDR before MetalFX, lazy clears
+/// of the native output, stale bind groups after resize, and carrying a native history through a cut.
+#[cfg(target_os = "macos")]
+#[test]
+fn metalfx_keeps_hdr_emitters_and_resets_on_a_cut() {
+    let Ok(gpu) = gpu::Gpu::new() else { return };
+    let mut w = world();
+    w.set_material(5, serde_json::from_value(serde_json::json!({
+        "name": "HDR panel", "color": [0, 0, 0], "opacity": 1, "metalness": 0, "roughness": 1,
+        "emissive": [1, 0.25, 0.5], "emissiveIntensity": 1800, "doubleSided": true,
+    })).unwrap());
+    w.set_transform(12, Vec3::new(0.0, 0.0, 1.0), glam::Quat::IDENTITY, Vec3::new(5.0, 0.5, 1.0)).unwrap();
+    w.set_camera_desc(4, camera(50.0, None, manual(6.0))).unwrap();
+    let mut core = LiveCore::new(gpu, &w, Path::new("."), &crate::default_presets_dir(), 320, 180).unwrap();
+    let scene_cam = core.cam;
+    let center = |c: &LiveCore| {
+        let hdr = c.read_hdr().unwrap();
+        assert!(hdr.iter().all(|v| v.is_finite() && *v >= 0.0));
+        let p = ((c.h / 2 * c.w + c.w / 2) * 3) as usize;
+        [hdr[p], hdr[p + 1], hdr[p + 2]]
+    };
+    core.set_scale(0.5);
+    for mode in [Reconstruction::Temporal, Reconstruction::Denoised] {
+        core.set_reconstruction(mode);
+        core.set_camera(scene_cam);
+        for _ in 0..16 { core.render(1, |_, _| {}); }
+        if core.reconstruction() == Reconstruction::Builtin {
+            eprintln!("{} unavailable on this device", mode.name());
+            continue;
+        }
+        for (v, reference) in center(&core).into_iter().zip([1800.0, 450.0, 900.0]) {
+            assert!((v / reference - 1.0).abs() < 0.2, "{}: {v} of {reference}", mode.name());
+        }
+        core.set_camera(Camera::look_at(scene_cam.pos, scene_cam.pos + Vec3::Z, scene_cam.tan_half_fov));
+        core.render(1, |_, _| {});
+        assert!(center(&core).iter().all(|v| *v < 1.0), "{}: bright history after cut", mode.name());
+        core.resize(257, 161).unwrap();
+        core.set_camera(scene_cam);
+        core.render(1, |_, _| {});
+        assert!(center(&core)[0] > 1000.0, "{}: missing output after resize", mode.name());
+        core.resize(320, 180).unwrap();
+    }
+}
