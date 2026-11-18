@@ -281,12 +281,24 @@ pub fn blas_tri(t: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 /// keeps the TLAS free of non-finite numbers, and can come back in place.
 pub fn instance_world(m: Mat4, t: &world::InstanceTable, i: usize) -> (Mat4, bool) {
     let w = m * t.matrix(i);
-    let det = glam::Mat3::from_mat4(w).determinant();
-    if i < t.count as usize && w.is_finite() && det.abs() > 1e-30 {
+    if i < t.count as usize {
+        return placed_world(w, m.w_axis.truncate());
+    }
+    (at_point(if w.w_axis.is_finite() { w.w_axis.truncate() } else { m.w_axis.truncate() }), true)
+}
+
+/// An instance's world matrix as the structure above the triangles takes it, and whether the placement has no size:
+/// not finite, or not invertible (scene code hides by scaling to 0). Such an instance stands at a point (its
+/// translation, or `fallback`), hidden.
+pub fn placed_world(w: Mat4, fallback: Vec3) -> (Mat4, bool) {
+    if w.is_finite() && glam::Mat3::from_mat4(w).determinant().abs() > 1e-30 {
         return (w, false);
     }
-    let at = if w.w_axis.is_finite() { w.w_axis.truncate() } else { m.w_axis.truncate() };
-    (Mat4::from_scale_rotation_translation(Vec3::splat(1e-6), glam::Quat::IDENTITY, at), true)
+    (at_point(if w.w_axis.is_finite() { w.w_axis.truncate() } else { fallback }), true)
+}
+
+fn at_point(at: Vec3) -> Mat4 {
+    Mat4::from_scale_rotation_translation(Vec3::splat(1e-6), glam::Quat::IDENTITY, at)
 }
 
 impl ProcObject {
@@ -647,9 +659,12 @@ pub struct Retained {
     pub sun: Option<u32>,
     /// Posed models sharing a pose (`PoseGroup`: its members' proxies name it, `MeshKind::Pose`).
     pub pose_groups: Vec<PoseGroup>,
-    /// `own_blas` meshes: (geometry, GPU material) -> the shared mesh (objects with the same geometry and material
-    /// share its BLAS). live/edits.rs `edit_geometry` keeps it.
-    pub own_mesh: HashMap<(u32, u32), u32>,
+    /// Meshes: (geometry, GPU materials: one, or a group's each) -> the shared mesh (objects with the same geometry and
+    /// materials share its BLAS). live/edits.rs `edit_geometry` keeps it.
+    pub own_mesh: HashMap<(u32, Vec<u32>), u32>,
+    /// Whether the scene said a mesh's geometry will be edited or driven (`own_blas`, `driven`): it gets room for
+    /// edits in place (gpu.rs `EditRoom`).
+    pub edits_meshes: bool,
     /// Static models' instanced meshes by (uri, nodes), those with nothing flattened per placement: a model added in
     /// place is another instance of one (live/edits.rs `edit_geometry`).
     pub model_mesh: HashMap<(String, Option<Vec<String>>), u32>,
@@ -752,9 +767,23 @@ impl Retained {
         self.proxies.values().any(|p| matches!(&p.draw, Draw::Rigid(_)) || matches!(&p.draw, Draw::Instance(i) if i.moves))
     }
 
-    /// Whether any object is an `own_blas` mesh's instance (what geometry edits place again).
+    /// The records of the instances an edit moves in place: a mesh's or a model's that moves (a body's, a movable
+    /// one's), a posed rigid model's nodes', an instanced object's copies.
+    pub fn moving_records(&self) -> std::collections::HashSet<u32> {
+        self.proxies
+            .values()
+            .flat_map(|p| match &p.draw {
+                Draw::Instance(i) if i.moves => vec![i.instance],
+                Draw::Rigid(r) => r.instances.iter().map(|&(_, i)| i).collect(),
+                Draw::Instanced(c) if c.mesh.is_some() => (c.first..c.first + c.capacity).collect(),
+                _ => vec![],
+            })
+            .collect()
+    }
+
+    /// Whether any object is a mesh the scene edits or drives (what geometry edits place again).
     pub fn has_own_instances(&self) -> bool {
-        self.proxies.values().any(|p| matches!(&p.draw, Draw::Instance(i) if i.mesh.own()))
+        self.edits_meshes
     }
 
     /// The triangles re-transformed on the CPU: the dynamic objects' and the rigid models' flattened ones.
@@ -1380,45 +1409,49 @@ pub fn build(w: &World, assets: &Path, presets_dir: &Path, overrides: Option<&se
         let shown = w.shown(*id);
         let flags = if n.cast_shadow { 0 } else { TRI_NO_SHADOW };
         match &n.kind {
-            Kind::Mesh { geometry, material, own_blas, materials: mesh_mats } if shown && instancing && mesh_mats.len() <= 1 && m.determinant() != 0.0 && (n.driven || (*own_blas && !w.movable(*id))) => {
-                // Its own BLAS (scene code's `dynamicGeometry`, or a mesh a rigid body drives: its moves are the
-                // instance's transform, `InstanceRef::moves`): placed like a model instance, its geometry's triangles
-                // in model space in the pool, shared by the objects of the same geometry and material, whatever the
-                // material (`mesh_class`: glass is its mesh's glass part; one that emits has each instance's
-                // emitters in the light list, `InstMesh::emitters`).
+            Kind::Mesh { geometry, material, own_blas, materials: mesh_mats } if shown && instancing && m.determinant() != 0.0 => {
+                // A mesh is an instance of its geometry's mesh: the triangles in model space in the pool, one BLAS,
+                // shared by the objects of the same geometry and materials, whatever those are (`mesh_class`: a
+                // cutout or glass is a part of the mesh; one that emits has each instance's emitters in the light
+                // list, `InstMesh::emitters`). A move is the instance's transform (`InstanceRef::moves`).
                 let g = w.geometries.get(geometry).ok_or_else(|| anyhow!("object {}: unknown geometry {geometry}", n.name))?;
                 let mat = *retained.materials.get(material).ok_or_else(|| anyhow!("object {}: unknown material {material}", n.name))?;
-                let class = mesh_class(&materials[mat as usize]);
-                let vc = colored(g, &mut std::iter::once(material));
-                {
-                    let mesh = match retained.own_mesh.get(&(*geometry, mat)) {
-                        Some(&k) => Some(k),
-                        None => {
-                            let (t, a) = own_mesh_tris(g, mat);
-                            (!t.is_empty()).then(|| {
-                                let mut im = own_inst_mesh(&t, pool_tris.len() as u32, class);
-                                if emissive(&materials[mat as usize]) {
-                                    im.emitters = t.len() as u32;
-                                }
-                                meshes.push(im);
-                                put_colors(&mut pool_vcolors, pool_tris.len(), vc.then(|| tri_colors(g, false, None)));
-                                pool_tris.extend(t);
-                                pool_attrs.extend(a);
-                                let k = meshes.len() as u32 - 1;
-                                retained.own_mesh.insert((*geometry, mat), k);
-                                k
-                            })
-                        }
-                    };
-                    if let Some(mesh) = mesh {
-                        let (lo, hi) = meshes[mesh as usize].placed_bounds(m);
-                        let pivot = m.transform_point3(Vec3::ZERO);
-                        let size = hi - lo;
-                        let oi = (objects.len() / stride) as u32;
-                        objects.extend_from_slice(&object_row(pivot, n.power, size, n.custom, [1.0; 3])[..stride]);
-                        *retained.proxy(*id) = Proxy { object: Some(oi), card: None, draw: Draw::Instance(InstanceRef { instance: instances.len() as u32, mesh: MeshKind::Own, moves: n.driven }) };
-                        instances.push(Instance { mesh, world: m, object: oi, cast_shadow: meshes[mesh as usize].casts(n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, first_emitter: 0 });
+                // Several materials: each geometry group's triangles with its own (three.js's material array).
+                let gpu_mats = mesh_mats.iter().map(|k| retained.materials.get(k).copied().ok_or_else(|| anyhow!("object {}: unknown material {k}", n.name))).collect::<Result<Vec<u32>>>()?;
+                let per_tri = group_materials(g, &gpu_mats);
+                let key = (*geometry, if per_tri.is_some() { gpu_mats } else { vec![mat] });
+                let mesh = match retained.own_mesh.get(&key) {
+                    Some(&k) => Some(k),
+                    None => {
+                        let (t, a, order, im) = own_mesh(g, mat, per_tri.as_deref(), &materials, pool_tris.len() as u32);
+                        (!t.is_empty()).then(|| {
+                            // Coloured where the triangle's own material asks (each group's; without groups, the mesh's).
+                            let wants = |k: &u32| w.materials.get(k).is_some_and(|m| m.vertex_colors);
+                            let vc_tri = group_materials(g, &mesh_mats.iter().map(|k| u32::from(wants(k))).collect::<Vec<_>>());
+                            let vc = !g.colors.is_empty() && match &vc_tri { Some(v) => v.iter().any(|f| *f == Some(1)), None => wants(material) };
+                            let colors = vc.then(|| {
+                                let c = tri_colors(g, false, vc_tri.as_deref());
+                                order.iter().map(|&k| c[k]).collect()
+                            });
+                            meshes.push(im);
+                            put_colors(&mut pool_vcolors, pool_tris.len(), colors);
+                            pool_tris.extend(t);
+                            pool_attrs.extend(a);
+                            let k = meshes.len() as u32 - 1;
+                            retained.own_mesh.insert(key, k);
+                            k
+                        })
                     }
+                };
+                if let Some(mesh) = mesh {
+                    let (lo, hi) = meshes[mesh as usize].placed_bounds(m);
+                    let pivot = m.transform_point3(Vec3::ZERO);
+                    let size = hi - lo;
+                    let oi = (objects.len() / stride) as u32;
+                    objects.extend_from_slice(&object_row(pivot, n.power, size, n.custom, [1.0; 3])[..stride]);
+                    retained.edits_meshes |= *own_blas || n.driven;
+                    *retained.proxy(*id) = Proxy { object: Some(oi), card: None, draw: Draw::Instance(InstanceRef { instance: instances.len() as u32, mesh: MeshKind::Own, moves: n.driven || w.movable(*id) }) };
+                    instances.push(Instance { mesh, world: m, object: oi, cast_shadow: meshes[mesh as usize].casts(n.cast_shadow), name: n.name.clone(), sub: None, hidden: false, first_emitter: 0 });
                 }
             }
             Kind::Instanced { geometry, procedural, materials: mats, capacity } if shown => {
@@ -2285,6 +2318,22 @@ pub fn own_mesh_tris(g: &world::Geometry, mat: u32) -> (Vec<[Vec3A; 3]>, Vec<Gpu
     (tris, attrs)
 }
 
+/// A mesh's triangles in model space as the pool holds them, ordered by class (`mesh_class`: a geometry of the mesh's
+/// BLAS each), their attributes, where each came from among the geometry's drawn triangles, and the mesh at pool index
+/// `first`. One material, or each group's (`per_tri`: `group_materials`).
+pub fn own_mesh(g: &world::Geometry, mat: u32, per_tri: Option<&[Option<u32>]>, materials: &[GpuMaterial], first: u32) -> (Vec<[Vec3A; 3]>, Vec<GpuTriAttr>, Vec<usize>, InstMesh) {
+    let (mut t, mut flags, mut a) = (vec![], vec![], vec![]);
+    append_arrays(g, Mat4::IDENTITY, mat, 0, per_tri, &mut t, &mut flags, &mut a);
+    let material = |k: usize| &materials[a[k].uv[3].to_bits() as usize];
+    let mut order: Vec<usize> = (0..t.len()).collect();
+    order.sort_by_key(|&k| mesh_class(material(k)));
+    let of = |class: u32| order.iter().filter(|&&k| mesh_class(material(k)) == class).count() as u32;
+    let mut im = own_inst_mesh(&t, first, 0);
+    (im.opaque, im.glass) = (of(0), of(2));
+    im.emitters = order.iter().filter(|&&k| emissive(material(k))).count() as u32;
+    (order.iter().map(|&k| t[k]).collect(), order.iter().map(|&k| a[k]).collect(), order, im)
+}
+
 /// A material that emits: a mesh's triangles of it are its instances' emitters in the light list
 /// (`InstMesh::emitters`).
 pub fn emissive(g: &GpuMaterial) -> bool {
@@ -2333,7 +2382,7 @@ pub fn own_inst_mesh(tris: &[[Vec3A; 3]], first: u32, class: u32) -> InstMesh {
 
 /// The GPU material of each triangle of a mesh with several (`Kind::Mesh::materials`, here GPU indices) by its
 /// geometry's groups; None for a triangle in no group (not drawn, as three.js). None for a mesh with one material.
-fn group_materials(g: &world::Geometry, mats: &[u32]) -> Option<Vec<Option<u32>>> {
+pub fn group_materials(g: &world::Geometry, mats: &[u32]) -> Option<Vec<Option<u32>>> {
     if mats.len() <= 1 || g.groups.is_empty() {
         return None;
     }
@@ -2648,6 +2697,34 @@ mod instance_tests {
                 assert!((t[1] - t[0]).cross(t[2] - t[0]).dot(Vec3A::new(a.n0[0], a.n0[1], a.n0[2])) > 0.0, "{what}: a flattened triangle faces away from its normals");
             }
         }
+    }
+
+    /// A mesh of several materials (a geometry group each) lies by class, opaque then cutout then glass, whatever the
+    /// order of its groups; each triangle keeps its material, `order` says where it came from among the geometry's
+    /// drawn triangles (one in no group is not drawn), and the mesh counts its parts and the triangles that emit.
+    #[test]
+    fn a_mesh_of_several_materials_lies_by_class() {
+        // Five quads along x: glass, a cutout, one in no group, an opaque one that emits, an opaque one.
+        let (mut positions, mut indices) = (vec![], vec![]);
+        for q in 0..5u32 {
+            let x = q as f32;
+            positions.extend([x, 0.0, 0.0, x + 1.0, 0.0, 0.0, x + 1.0, 1.0, 0.0, x, 1.0, 0.0]);
+            indices.extend([0, 1, 2, 0, 2, 3].map(|i| 4 * q + i));
+        }
+        let g = world::Geometry { normals: [0.0, 0.0, 1.0].repeat(20), uvs: vec![0.0; 40], positions, indices, groups: vec![[0, 6, 0], [6, 6, 1], [18, 6, 2], [24, 6, 3]], colors: vec![] };
+        let materials = [GpuMaterial { layer: [1.0, 1.5, 0.0, 0.0], ..Default::default() }, GpuMaterial { uv2: [0.0, 0.0, 0.0, 0.5], ..Default::default() }, GpuMaterial { emissive: [1.0, 1.0, 1.0, 0.0], ..Default::default() }, GpuMaterial::default()];
+        let per_tri = group_materials(&g, &[0, 1, 2, 3]).unwrap();
+        assert_eq!(per_tri, [Some(0), Some(0), Some(1), Some(1), None, None, Some(2), Some(2), Some(3), Some(3)]);
+        let (t, a, order, im) = own_mesh(&g, 0, Some(&per_tri), &materials, 10);
+        assert_eq!(order, [4, 5, 6, 7, 2, 3, 0, 1], "the opaque triangles, the cutout's, the glass's");
+        assert_eq!(a.iter().map(|a| a.uv[3].to_bits()).collect::<Vec<_>>(), [2, 2, 3, 3, 1, 1, 0, 0]);
+        assert_eq!(t.iter().map(|t| t[0].x.min(t[1].x).min(t[2].x)).collect::<Vec<_>>(), [3.0, 3.0, 4.0, 4.0, 1.0, 1.0, 0.0, 0.0], "each where its material is");
+        assert_eq!((im.first, im.count, im.opaque, im.glass, im.emitters), (10, 8, 4, 2, 2));
+        assert_eq!((im.parts(), im.part_offsets()), (vec![(0, 4, true), (4, 2, true), (6, 2, false)], [4, 6]));
+        assert_eq!((im.lo, im.hi), (Vec3A::new(0.0, 0.0, 0.0), Vec3A::new(5.0, 1.0, 0.0)), "bounds of what is drawn");
+        // One material: as the geometry has them.
+        let (_, a1, order1, one) = own_mesh(&g, 1, None, &materials, 0);
+        assert_eq!((order1, a1.len(), one.opaque, one.glass, one.emitters), ((0..10).collect::<Vec<_>>(), 10, 0, 0, 0), "a cutout mesh");
     }
 
     /// A model's glass is a part of its mesh (tests/render/data/frame-pane.glb: an opaque, a cutout and a glass quad;
