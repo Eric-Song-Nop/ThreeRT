@@ -95,13 +95,13 @@ void threert_fx_bind(void *scaler, bool denoise, void *const *inputs, void *outp
 #if __has_include(<MetalFX/MTLFXTemporalDenoisedScaler.h>)
     if (denoise) {
         id<MTLFXTemporalDenoisedScaler> d = s;
-        d.diffuseAlbedoTexture = (__bridge id)inputs[4];
-        d.specularAlbedoTexture = (__bridge id)inputs[5];
-        d.normalTexture = (__bridge id)inputs[6];
-        d.roughnessTexture = (__bridge id)inputs[7];
-        d.specularHitDistanceTexture = (__bridge id)inputs[8];
-        d.denoiseStrengthMaskTexture = (__bridge id)inputs[9];
-        d.transparencyOverlayTexture = (__bridge id)inputs[10];
+        d.diffuseAlbedoTexture = (__bridge id)inputs[6];
+        d.specularAlbedoTexture = (__bridge id)inputs[7];
+        d.normalTexture = (__bridge id)inputs[8];
+        d.roughnessTexture = (__bridge id)inputs[9];
+        d.specularHitDistanceTexture = (__bridge id)inputs[10];
+        d.denoiseStrengthMaskTexture = (__bridge id)inputs[5];
+        d.transparencyOverlayTexture = (__bridge id)inputs[4];
     }
 #endif
 #endif

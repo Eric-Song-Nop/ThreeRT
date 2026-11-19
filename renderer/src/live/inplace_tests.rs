@@ -890,8 +890,8 @@ fn metalfx_keeps_hdr_emitters_and_resets_on_a_cut() {
         let p = ((c.h / 2 * c.w + c.w / 2) * 3) as usize;
         [hdr[p], hdr[p + 1], hdr[p + 2]]
     };
-    core.set_scale(0.5);
     for mode in [Reconstruction::Temporal, Reconstruction::Denoised] {
+        core.set_scale(0.5);
         core.set_reconstruction(mode);
         core.set_camera(scene_cam);
         for _ in 0..16 { core.render(1, |_, _| {}); }
@@ -901,6 +901,13 @@ fn metalfx_keeps_hdr_emitters_and_resets_on_a_cut() {
         }
         for (v, reference) in center(&core).into_iter().zip([1800.0, 450.0, 900.0]) {
             assert!((v / reference - 1.0).abs() < 0.2, "{}: {v} of {reference}", mode.name());
+        }
+        core.set_scale(0.0);
+        for scale in [0.5, 0.75, 0.625] {
+            core.render_scale = scale;
+            core.render(1, |_, _| {});
+            assert_eq!(core.reconstruction(), mode);
+            assert!(center(&core)[0] > 1000.0, "{}: missing dynamic input at {scale}", mode.name());
         }
         core.set_camera(Camera::look_at(scene_cam.pos, scene_cam.pos + Vec3::Z, scene_cam.tan_half_fov));
         core.render(1, |_, _| {});

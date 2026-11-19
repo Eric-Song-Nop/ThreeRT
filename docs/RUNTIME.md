@@ -1602,7 +1602,7 @@ none of them it traces its light there. Two limits are known and held by tests s
 
 ## Live reconstruction on macOS
 
-The `play` window and headless `live` renderer share the same reconstruction path. From the repository root:
+The `play` window and headless `live` renderer share the same reconstruction path. Run the example from the repository root.
 
 ```sh
 node tools/bundle-game.ts scenes/neon-reflections.ts
@@ -1624,17 +1624,32 @@ the device and requested dimensions when it creates either scaler. An unavailabl
 dynamic resolution changes inside the supported range. The denoised scaler starts a new history when its
 input dimensions change.
 
+In the Mac scene viewer, press `M` to cycle through the three implementations. The title bar shows the
+active mode. Games that handle keyboard input keep their key bindings.
+
 Both scalers receive scene-linear HDR, reverse-Z depth, camera and object motion, subpixel jitter and a reactive
 mask on systems that support it. The denoised scaler also receives world-space shading normals, diffuse and
 specular reflectance, roughness, a denoising mask and specular hit distance. For smooth mirrors and glass,
-secondary ray queries add the reflected and transmitted surfaces to the material guides. Exposure, bloom,
+secondary ray queries add the reflected and transmitted surfaces to the material guides. Directly visible
+sky and emission-dominated pixels use the native overlay. The denoise mask is 1 on those pixels and
+0 on surfaces with noisy lighting. Exposure, bloom,
 depth of field and motion blur process the reconstructed HDR image on the GPU.
 
 Set `THREERT_RECONSTRUCTION` for a native process that embeds `LiveCore`, or call
 `LiveCore::set_reconstruction` from Rust. The command-line flag overrides the environment.
 Send `{"cmd":"reconstruction","mode":"metalfx"}` to switch a running `live` or `play` session.
-Snapshot metadata reports both `requested_reconstruction` and the active `reconstruction`.
+The viewer's JSON `stats` messages report both `requested_reconstruction` and the active `reconstruction`.
 The `live --frame-log` JSON lines also record the active implementation.
+Live jobs sent to `threert-render serve` accept the same mode in `reconstruction` and a numeric `scale`.
+
+Run `node tools/bench-metalfx.ts` after building the release binary to compare the three paths against
+256-spp offline references for a still camera and a lateral move. It saves the frames, frame timings
+and image metrics under `out/metalfx/` and checks which implementation actually ran.
+Use `--scene glass` for the refraction workbench or `--scene cornell` for the Cornell box.
+On an Apple M1 running macOS 27.2.1, the glass camera move scored 0.909 SSIM with the built-in path,
+0.944 with MetalFX temporal and 0.940 with joint denoising. At the same 320 × 180 input and 640 × 360
+output, median GPU frame times with the camera held still were 9.69, 9.78 and 10.22 ms respectively.
+On the Cornell box the built-in path scored highest for both camera poses.
 
 ## Moving objects in the live view
 

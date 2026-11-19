@@ -446,6 +446,13 @@ impl ApplicationHandler for App {
                             "Escape" => el.exit(),
                             "R" => s.orbit = s.home,
                             "P" => s.snapshot = Some(PathBuf::from(format!("view-{}.png", s.core.frame))),
+                            #[cfg(target_os = "macos")]
+                            "M" => {
+                                use crate::live::Reconstruction::*;
+                                s.core.set_reconstruction(match s.core.requested_reconstruction() {
+                                    Builtin => Temporal, Temporal => Denoised, Denoised | Auto => Builtin,
+                                });
+                            }
                             "0" => s.spp_cap = 16,
                             "1" | "2" | "4" | "8" => s.spp_cap = name.parse().unwrap(),
                             // F1..F6 style view modes on the number row with Alt held
@@ -736,10 +743,11 @@ fn frame(s: &mut State, cmds: &mpsc::Receiver<Cmd>, services: &mut dyn HostServi
         let g = &s.game;
         let status = [s.status.as_str(), g.status.as_str()].iter().filter(|t| !t.is_empty()).map(|t| format!("{t} · ")).collect::<String>() + &format!("frame script {:.2} ms", g.frame_ms);
         s.window.set_title(&format!(
-            "ThreeRT live · {:.0} fps · {} spp/frame · GPU {:.1} ms · {conv}{}",
+            "ThreeRT live · {:.0} fps · {} spp/frame · GPU {:.1} ms · {} · {conv}{}",
             s.fps,
             s.spp,
             s.core.gpu_ms,
+            s.core.reconstruction().name(),
             if status.is_empty() { String::new() } else { format!(" · {status}") }
         ));
         let mut st = s.core.meta();

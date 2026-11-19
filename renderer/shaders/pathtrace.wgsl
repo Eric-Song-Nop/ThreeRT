@@ -3461,6 +3461,10 @@ fn finish(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Deterministic reconstruction guides at smooth reflectors. Using the random BSDF sample makes
 // glass alternate between two different materials and leaves a hole wherever a diffuse lobe was drawn.
 struct GuideHit { albedo: vec3<f32>, normal: vec3<f32>, rough: f32, distance: f32 };
+fn guide_color(radiance: vec3<f32>) -> vec3<f32> {
+    // Keep a dark background dark and preserve the hue of bright emitters in the albedo guide.
+    return radiance / max(1.0, max(radiance.r, max(radiance.g, radiance.b)));
+}
 fn guide_hit(origin: vec3<f32>, dir: vec3<f32>, footprint: f32, through_glass: bool) -> GuideHit {
     var o = offset_origin(origin, dir);
     var d = dir;
@@ -3468,7 +3472,9 @@ fn guide_hit(origin: vec3<f32>, dir: vec3<f32>, footprint: f32, through_glass: b
     for (var i = 0u; i < 2u; i++) {
         let h = trace(o, d, INF, TRACE_CLOSEST);
         if (h.tri == 0xffffffffu) {
-            return GuideHit(vec3<f32>(1.0), -d, 1.0, select(first, 1e4, i == 0u));
+            var sky = env_radiance(d);
+            if (through_glass) { sky = sky_mis(d, 0.0); }
+            return GuideHit(guide_color(sky), -d, 1.0, select(first, 1e4, i == 0u));
         }
         if (i == 0u) { first = h.t; }
         let s = surface(o, d, h, footprint + h.t * 2.0 * P.cam_pos.w / lod_height());
@@ -3480,7 +3486,7 @@ fn guide_hit(origin: vec3<f32>, dir: vec3<f32>, footprint: f32, through_glass: b
             continue;
         }
         let m = lobes(s, max(dot(s.n, -d), 1e-4));
-        let emission = s.emissive / max(1.0, max(s.emissive.x, max(s.emissive.y, s.emissive.z)));
+        let emission = guide_color(s.emissive);
         return GuideHit(clamp(max(cache_reflectance(m), emission), vec3<f32>(0.0), vec3<f32>(1.0)), s.n, s.roughness, first);
     }
     return GuideHit(vec3<f32>(1.0), -d, 1.0, first);
@@ -3495,6 +3501,9 @@ fn guide_hit(origin: vec3<f32>, dir: vec3<f32>, footprint: f32, through_glass: b
     var alb = diffuse.rgb;
     var normal = px.normal.xyz;
     var rough = px.emit.w;
+    // Rough surfaces have no single reflected point. A stochastic second-bounce hit would move
+    // their guide even when both the object and camera stand still.
+    accum[q].spec.w = 0.0;
     if (px.color.w > 0.0 && rough < MIRROR_ROUGHNESS && P.raster.w == 0.0 &&
         (any(specular.rgb > vec3<f32>(0.005)) || diffuse.w > 0.0)) {
         cur_depth = 1u;

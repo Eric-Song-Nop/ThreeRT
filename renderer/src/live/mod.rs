@@ -598,6 +598,8 @@ impl LiveCore {
 
     pub fn reconstruction(&self) -> Reconstruction { self.active_reconstruction }
 
+    pub fn requested_reconstruction(&self) -> Reconstruction { self.requested_reconstruction }
+
     pub fn scene_camera(&self) -> Camera {
         self.view.camera
     }

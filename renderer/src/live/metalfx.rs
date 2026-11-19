@@ -7,7 +7,8 @@ use wgpu::hal::api::Metal;
 use wgpu::TextureFormat::{self, *};
 
 const INPUTS: &[TextureFormat] = &[Rgba16Float, R32Float, Rg16Float, R8Unorm];
-const GUIDES: &[TextureFormat] = &[Rgba8Unorm, Rgba8Unorm, Rgba16Float, R16Float, R16Float, R8Unorm, Rgba16Float];
+const LAYERS: &[TextureFormat] = &[Rgba16Float, R8Unorm];
+const GUIDES: &[TextureFormat] = &[Rgba8Unorm, Rgba8Unorm, Rgba16Float, R16Float, R16Float];
 
 unsafe extern "C" {
     fn threert_fx_create(
@@ -37,6 +38,9 @@ unsafe extern "C" {
 }
 
 struct Scaler(NonNull<c_void>);
+// A retained Metal object can move with its LiveCore. Only an exclusive borrow of that core
+// binds or encodes the scaler, and command-buffer completion holds its own Objective-C retain.
+unsafe impl Send for Scaler {}
 impl Drop for Scaler {
     fn drop(&mut self) {
         unsafe { threert_fx_release(self.0.as_ptr()) };
@@ -45,6 +49,7 @@ impl Drop for Scaler {
 
 struct Pipelines {
     inputs: wgpu::RenderPipeline,
+    denoised_inputs: wgpu::RenderPipeline,
     guides: wgpu::RenderPipeline,
     output: wgpu::ComputePipeline,
 }
@@ -91,6 +96,7 @@ impl Pipelines {
         });
         Self {
             inputs: render("fx_inputs", INPUTS),
+            denoised_inputs: render("fx_denoised_inputs", &[INPUTS, LAYERS].concat()),
             guides: render("fx_guides", GUIDES),
             output,
         }
@@ -155,7 +161,10 @@ impl Resources {
             let raw = unsafe { t.as_hal::<Metal>() }.expect("Metal device");
             (view, std::ptr::from_ref(raw.raw_handle()).cast::<c_void>())
         };
-        let formats = INPUTS.iter().chain(if denoise { GUIDES } else { &[] });
+        let formats = INPUTS
+            .iter()
+            .chain(if denoise { LAYERS } else { &[] })
+            .chain(if denoise { GUIDES } else { &[] });
         let (inputs, raw): (Vec<_>, Vec<_>) = formats
             .map(|f| {
                 texture(
@@ -186,8 +195,15 @@ impl Resources {
                 entries: &entries,
             })
         };
-        let base_group = bind(pipes.inputs.get_bind_group_layout(0), &["L", "fb", "sample_vel"]);
-        let guide_group = denoise.then(|| bind(pipes.guides.get_bind_group_layout(0), &["L", "sample_px", "refl_in", "fb"]));
+        let base_group = if denoise {
+            bind(
+                pipes.denoised_inputs.get_bind_group_layout(0),
+                &["L", "fb", "sample_px", "sample_vel"],
+            )
+        } else {
+            bind(pipes.inputs.get_bind_group_layout(0), &["L", "fb", "sample_vel"])
+        };
+        let guide_group = denoise.then(|| bind(pipes.guides.get_bind_group_layout(0), &["L", "sample_px", "refl_in"]));
         let post_group = bind(pipes.output.get_bind_group_layout(0), &["L", "fa", "sb", "sample_vel"]);
         let output_group = d.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("MetalFX HDR"),
@@ -331,9 +347,12 @@ impl MetalFx {
             pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         };
-        pack(&r.inputs[..INPUTS.len()], &p.inputs, &r.base_group);
         if let Some(group) = &r.guide_group {
-            pack(&r.inputs[INPUTS.len()..], &p.guides, group);
+            let (base, guides) = r.inputs.split_at(INPUTS.len() + LAYERS.len());
+            pack(base, &p.denoised_inputs, &r.base_group);
+            pack(guides, &p.guides, group);
+        } else {
+            pack(&r.inputs, &p.inputs, &r.base_group);
         }
         let view = glam::Mat4::look_to_rh(cam.pos, cam.fwd, cam.up).to_cols_array();
         let proj = glam::Mat4::perspective_infinite_reverse_rh(2.0 * cam.tan_half_fov.atan(), aspect, 0.01).to_cols_array();
