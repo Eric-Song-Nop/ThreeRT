@@ -236,7 +236,7 @@ impl App {
             eprintln!("view: the game reads input (pointer: {p}){}", if p == "look" { ": click to capture the pointer, Esc lets go" } else { "" });
         }
         core.bounces = a.bounces;
-        if let Some(mode) = a.reconstruction { core.set_reconstruction(mode); }
+        if let Some(mode) = &a.reconstruction { core.set_reconstruction(mode.clone()); }
         core.set_scale(a.scale.unwrap_or(0.0));
         core.set_display_scale(window.scale_factor() as f32);
         let d = &core.g.device;
@@ -450,7 +450,7 @@ impl ApplicationHandler for App {
                             "M" => {
                                 use crate::live::Reconstruction::*;
                                 s.core.set_reconstruction(match s.core.requested_reconstruction() {
-                                    Builtin => Temporal, Temporal => Denoised, Denoised | Auto => Builtin,
+                                    Builtin => Temporal, Temporal => Denoised, _ => Builtin,
                                 });
                             }
                             "0" => s.spp_cap = 16,

@@ -402,7 +402,8 @@ fn render_live(slot: &mut Option<gpu::Gpu>, job: &Job, presets: &Path, frames: u
     };
     g.set_approx(job.approx);
     let mut core = live::LiveCore::new(g, &w, &job.game.assets, presets, width, height)?;
-    if let Some(mode) = job.reconstruction { core.set_reconstruction(mode); }
+    host.attach_reconstruction(&mut core);
+    if let Some(mode) = &job.reconstruction { core.set_reconstruction(mode.clone()); }
     core.set_scale(job.scale.unwrap_or(1.0));
     drop(w);
     // A frame script runs at 60 fps: the renderer's frame time is the same (motion blur, exposure adaptation).
@@ -431,10 +432,13 @@ fn render_live(slot: &mut Option<gpu::Gpu>, job: &Job, presets: &Path, frames: u
     }
     let ev100 = core.read_ev100()?;
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let reconstruction = core.reconstruction().name();
-    let scale = core.render_scale;
+    let info = serde_json::json!({
+        "width": width, "height": height, "frames": frames, "scale": core.render_scale,
+        "reconstruction": core.reconstruction().name(), "requested_reconstruction": core.requested_reconstruction().name(),
+        "ev100": ev100, "timings_ms": { "total_ms": ms }
+    });
     *slot = Some(core.g);
-    Ok(serde_json::json!({ "width": width, "height": height, "frames": frames, "scale": scale, "reconstruction": reconstruction, "ev100": ev100, "timings_ms": { "total_ms": ms } }))
+    Ok(info)
 }
 
 /// PREFIX-diffuse.raw, -specular.raw, -emission.raw (RGB f32 each).

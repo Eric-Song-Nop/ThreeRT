@@ -231,7 +231,7 @@ impl Resources {
 
 #[derive(Default)]
 pub(super) struct MetalFx {
-    key: Option<(Reconstruction, (u32, u32), (u32, u32), bool)>,
+    key: Option<(&'static [bool], [u32; 2], [u32; 2], bool)>,
     pipes: Option<Pipelines>,
     resources: Option<Resources>,
 }
@@ -246,18 +246,23 @@ impl MetalFx {
         &mut self,
         g: &gpu::Gpu,
         targets: &Targets,
-        mode: Reconstruction,
-        input: (u32, u32),
-        out: (u32, u32),
-        dynamic: bool,
-    ) -> Reconstruction {
-        let key = Some((mode, input, out, dynamic));
+        mode: &Reconstruction,
+        size: ReconstructionSize,
+    ) -> Option<Active> {
+        let candidates: &'static [bool] = match mode {
+            Reconstruction::Auto => &[true, false],
+            Reconstruction::Temporal => &[false],
+            Reconstruction::Denoised => &[true],
+            _ => return None,
+        };
+        let ReconstructionSize { input, output: out, dynamic } = size;
+        let key = Some((candidates, input, out, dynamic));
         if self.key != key && dynamic {
-            if let (Some((prev_mode, _, prev_out, true)), Some([min, max])) =
+            if let (Some((prev, _, prev_out, true)), Some([min, max])) =
                 (self.key, self.resources.as_ref().and_then(|r| r.dynamic_range))
             {
                 let fits = |i: u32, o: u32| i >= (o as f32 / max).floor() as u32 && i <= (o as f32 / min).ceil() as u32;
-                if mode == prev_mode && out == prev_out && fits(input.0, out.0) && fits(input.1, out.1) {
+                if candidates == prev && out == prev_out && fits(input[0], out[0]) && fits(input[1], out[1]) {
                     self.key = key;
                 }
             }
@@ -265,21 +270,14 @@ impl MetalFx {
         if self.key != key {
             self.invalidate();
             self.key = key;
-            let candidates: &[Reconstruction] = match mode {
-                Reconstruction::Auto => &[Reconstruction::Denoised, Reconstruction::Temporal],
-                Reconstruction::Temporal => &[Reconstruction::Temporal],
-                Reconstruction::Denoised => &[Reconstruction::Denoised],
-                Reconstruction::Builtin => &[],
-            };
-            for &candidate in candidates {
-                let denoise = candidate == Reconstruction::Denoised;
+            for &denoise in candidates {
                 // Release the HAL guard before making further calls on the wgpu device.
                 let mut scales = [1.0f32; 2];
                 let dynamic_inputs = dynamic && !denoise;
                 let raw = unsafe { g.device.as_hal::<Metal>() }.and_then(|dev| {
                     let ptr = std::ptr::from_ref(&**dev.raw_device()).cast();
                     NonNull::new(unsafe {
-                        threert_fx_create(ptr, denoise, dynamic_inputs, input.0, input.1, out.0, out.1, scales.as_mut_ptr())
+                        threert_fx_create(ptr, denoise, dynamic_inputs, input[0], input[1], out[0], out[1], scales.as_mut_ptr())
                     })
                 });
                 if let Some(raw) = raw {
@@ -291,25 +289,17 @@ impl MetalFx {
                         pipes,
                         scaler,
                         denoise,
-                        input,
-                        out,
+                        (input[0], input[1]),
+                        (out[0], out[1]),
                         dynamic_inputs.then_some(scales),
                     ));
                     break;
                 }
             }
-            if !candidates.is_empty() && self.resources.is_none() {
-                eprintln!(
-                    "live: {} unavailable at {input:?} -> {out:?}, using builtin reconstruction",
-                    mode.name()
-                );
-            }
         }
-        match &self.resources {
-            None => Reconstruction::Builtin,
-            Some(r) if r.guide_group.is_some() => Reconstruction::Denoised,
-            Some(_) => Reconstruction::Temporal,
-        }
+        self.resources.as_ref().map(|r| {
+            if r.guide_group.is_some() { Active::MetalFxDenoised } else { Active::MetalFx }
+        })
     }
 
     pub(super) fn encode(
@@ -322,7 +312,7 @@ impl MetalFx {
         exposure: f32,
         reset: bool,
     ) -> [wgpu::CommandBuffer; 2] {
-        let (_, (iw, ih), _, _) = self.key.expect("prepared MetalFX");
+        let (_, [iw, ih], _, _) = self.key.expect("prepared MetalFX");
         let r = self.resources.as_mut().expect("prepared MetalFX");
         let p = self.pipes.as_ref().unwrap();
         if r.fresh {
