@@ -42,9 +42,12 @@ pub struct Tables {
     pub(crate) emissive: HashSet<u32>,
     /// A material that starts emitting gets emitter entries in place (the live view sets these up, `prepare`'s
     /// `mat_runs` / `fixed_mats`): it is queued in `started_emitting` for live/edits.rs `add_material_emitters`, unless its
-    /// triangles include pool or dynamic ones (fixed: a rebuild flattens them). Off: such a material rebuilds.
+    /// triangles include a model's, an instanced object's or dynamic ones (`fixed_mats` less `mesh_mats`, the materials
+    /// whose pool triangles are meshes' alone). Off: such a material rebuilds. `fixed_mats` are also the materials of
+    /// instances' triangles, whose class a rebuild sorts by (`apply`).
     pub emit_in_place: bool,
     pub fixed_mats: HashSet<u32>,
+    pub mesh_mats: HashSet<u32>,
     pub started_emitting: Vec<u32>,
     /// Object -> its entries in `lights`.
     pub light_index: HashMap<u32, Vec<usize>>,
@@ -73,6 +76,7 @@ impl Tables {
             light_tree,
             emit_in_place: false,
             fixed_mats: HashSet::new(),
+            mesh_mats: HashSet::new(),
             started_emitting: vec![],
             light_index,
             stride: sc.object_stride(),
@@ -106,12 +110,16 @@ impl Tables {
             let o = w.objects.get(id).ok_or_else(|| anyhow!("unknown object {id}"))?;
             if let Some(oi) = self.retained.object(*id) {
                 let row = oi as usize * self.stride;
+                // (The row of a mesh or a model that is hidden, or placed without size, has no power: its instance's emitters at
+                // no weight until it comes back.)
+                let unseen = matches!(o.kind, Kind::Mesh { .. } | Kind::Model { .. }) && (!w.shown(*id) || scene::placed_world(w.world_matrix(*id), glam::Vec3::ZERO).1);
+                let power = if unseen { 0.0 } else { o.power.max(0.0) };
                 if self.defer_powers {
                     self.deferred.retain(|p| p.0 != row);
-                    self.deferred.push((row, o.power.max(0.0), now));
+                    self.deferred.push((row, power, now));
                     d.deferred = true;
                 } else {
-                    self.put_powers(&[(row, o.power.max(0.0), now)]);
+                    self.put_powers(&[(row, power, now)]);
                     d.objects = true;
                     d.emitters = true;
                 }
@@ -247,7 +255,7 @@ impl Tables {
         if lum <= 0.0 || self.emissive.contains(&mi) {
             return true;
         }
-        if !self.emit_in_place || self.fixed_mats.contains(&mi) {
+        if !self.emit_in_place || (self.fixed_mats.contains(&mi) && !self.mesh_mats.contains(&mi)) {
             return false;
         }
         self.emissive.insert(mi);

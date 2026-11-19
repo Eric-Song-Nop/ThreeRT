@@ -195,10 +195,10 @@ fn edits_in_place_leave_what_a_build_does() {
     assert!(!live.commit(&mut w).unwrap() && live.cam == away && live.view.dof.is_some(), "a depth of field and an exposure: the view stays");
     w.set_camera_desc(6, camera(40.0, Some(3.0), manual(2.0))).unwrap();
     assert!(!live.commit(&mut w).unwrap() && live.cam == live.view.camera && live.cam != away, "a lens: the view takes the scene's camera");
-    // A commit that rebuilds (another mesh) and brings another preset with it.
-    w.set_object(13, "more".into(), None, Kind::Mesh { geometry: 3, material: 1, own_blas: false, materials: vec![] }, true, false).unwrap();
+    // A commit that rebuilds (another group: what a build places) and brings another preset with it.
+    w.set_object(13, "more".into(), None, Kind::Group, true, false).unwrap();
     w.set_settings(Settings { preset: "cinematic".into(), overrides: Some(serde_json::json!({ "post": { "vignette": 0.3 } })), ..w.settings.clone() });
-    assert!(live.commit(&mut w).unwrap(), "another mesh: a rebuild");
+    assert!(live.commit(&mut w).unwrap(), "another group: a rebuild");
     let mut fresh = open(&w).unwrap();
     (picture(&mut live, 1), picture(&mut fresh, 1));
     same_state("a rebuild with another preset", &live, &fresh);
@@ -318,6 +318,9 @@ fn moves_in_place_leave_what_a_build_does() {
                 w.set_transform(13, at(0.2, 0.2, 0.7), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
             }),
         ),
+        // (Scene code hides by scaling to 0: the instance stands at a point where no ray sees it, and comes back.)
+        ("the movable mesh scaled to nothing", Box::new(move |w| w.set_transform(13, at(0.2, 0.2, 0.7), glam::Quat::IDENTITY, Vec3::ZERO).unwrap())),
+        ("the movable mesh back at its size", Box::new(move |w| w.set_transform(13, at(-0.1, 0.3, 0.8), glam::Quat::IDENTITY, Vec3::ONE).unwrap())),
     ];
     for (what, edit) in &edits {
         edit(&mut w);
@@ -326,6 +329,7 @@ fn moves_in_place_leave_what_a_build_does() {
         // (Software traversal places some of these another way, and may rebuild: the picture holds either way.)
         assert!(!(rebuilt && live.g.hwrt), "{what}: in place ({:?})", live.fallback);
         assert_eq!(live.top_builds - builds, u32::from(!rebuilt), "{what}: one build above the triangles a commit, whatever moved");
+        assert!(live.sc.instances.iter().all(|i| i.world.is_finite() && i.world.determinant() != 0.0), "{what}: every instance has a size above the triangles");
         let mut fresh = open(&w).unwrap();
         forget(&mut live);
         let (a, b) = (picture(&mut live, 24), picture(&mut fresh, 24));
@@ -412,6 +416,8 @@ fn list_is_its_triangles(what: &str, c: &LiveCore) {
     let codes = crate::emitter_codes(&tables.emitter_tris, &crate::emitter_order(&tables.emitter_tris, tables.light_tree.as_ref()), tables.light_tree.as_ref());
     // (The CDF as the kernel reads it: an emitter that is not the tree's is found by the entry its code names.)
     let cdf = read(&up.heap.buffer, up.heap.at(Table::Emitters), (tables.emitter_tris.len() * 16) as u64);
+    let record_size = std::mem::size_of::<scene::GpuInstance>();
+    let records = read(&up.heap.buffer, up.heap.at(Table::Instances), (c.sc.gpu_instances.len() * record_size) as u64);
     let mut alive = 0;
     for (i, e) in tables.emitter_tris.iter().enumerate() {
         let r: crate::GpuEmitterTri = bytemuck::pod_read_unaligned(&list[i * size..][..size]);
@@ -430,7 +436,8 @@ fn list_is_its_triangles(what: &str, c: &LiveCore) {
             assert_eq!(r, crate::GpuEmitterTri::new(e, &rows, code & !crate::EMITTER_MOVES), "{what}: emitter {i} of the list against its triangle {}", e.tri);
             assert_eq!(a.x[3].to_bits(), i as u32 + 1, "{what}: triangle {} names its emitter", e.tri);
         } else {
-            let (inst, record) = (&c.sc.instances[e.inst as usize], &c.sc.gpu_instances[e.inst as usize]);
+            // (The record as the GPU has it.)
+            let (inst, record) = (&c.sc.instances[e.inst as usize], bytemuck::pod_read_unaligned::<scene::GpuInstance>(&records[e.inst as usize * record_size..][..record_size]));
             let at = |k: usize| glam::Vec3::new(rows[k][0], rows[k][1], rows[k][2]);
             let placed = [inst.world.transform_point3(at(0)), inst.world.transform_vector3(at(1)), inst.world.transform_vector3(at(2))];
             assert_eq!((r.tri, r.inst, r.code), (e.tri, e.inst, code), "{what}: emitter {i}'s words");
@@ -716,7 +723,7 @@ fn an_emitter_scaled_in_place_is_lit_as_a_build_lights_it() {
 fn the_light_list_holds_its_triangles() {
     let presets = crate::default_presets_dir();
     let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
-    // An emitter the CPU moves.
+    // An emitter that moves: a movable mesh is an instance of its mesh, its emitters its instance's.
     for tree in [true, false] {
         let mut w = world();
         w.set_object(13, "mover".into(), None, Kind::Mesh { geometry: 3, material: 5, own_blas: false, materials: vec![] }, true, true).unwrap();
@@ -730,7 +737,8 @@ fn the_light_list_holds_its_triangles() {
         };
         w.take_changes();
         assert_eq!(live.sc.tables.light_tree.as_ref().is_some_and(|t| t.moving_count > 0), tree, "the mover is in the tree's moving subtree");
-        assert_eq!(live.sc.up.fills.moved.is_some(), live.g.hwrt, "the mover's emitters are filled on the GPU");
+        assert!(live.sc.tables.emitter_tris.iter().any(|e| e.inst != crate::NO_INST && e.moves), "the mover's emitters are its instance's");
+        assert!(live.sc.up.fills.moved.is_none(), "no triangle is left for the CPU to move");
         list_is_its_triangles("a moving emitter, as loaded", &live);
         w.set_transform(13, Vec3::new(0.1, -0.3, 0.9), glam::Quat::from_rotation_z(0.5), Vec3::ONE).unwrap();
         let rebuilt = live.commit(&mut w).unwrap();
@@ -768,7 +776,7 @@ fn the_light_list_holds_its_triangles() {
     w.take_changes();
     if live.g.hwrt {
         let of_instances = live.sc.tables.emitter_tris.iter().filter(|e| e.inst != crate::NO_INST).count();
-        assert_eq!(of_instances, 6, "two emitters a placement of the model, each its instance's");
+        assert_eq!(of_instances, 8, "the lamp's two, and two a placement of the model, each its instance's");
         // (An instance an edit moves in place has moving emitters: no light LOD from a centroid that goes stale, the
         // light tree's moving subtree. One that stays has not.)
         let moves = |id: u32| {
@@ -781,7 +789,7 @@ fn the_light_list_holds_its_triangles() {
             (of.len(), of.iter().all(|m| *m))
         };
         assert_eq!((moves(31), moves(32)), ((2, true), (2, true)), "the movable and the posed model's emitters move");
-        assert!(live.sc.tables.emitter_tris.iter().filter(|e| e.inst != crate::NO_INST && !e.moves).count() == 2, "the still model's do not");
+        assert!(live.sc.tables.emitter_tris.iter().filter(|e| e.inst != crate::NO_INST && !e.moves).count() == 4, "the lamp's and the still model's do not");
         list_is_its_triangles("a model's emitters, as loaded", &live);
         type Move = (&'static str, Box<dyn Fn(&mut World)>);
         let moves: Vec<Move> = vec![
@@ -871,6 +879,454 @@ fn the_light_list_holds_its_triangles() {
         let (a, b) = (picture(&mut live, 24), picture(&mut fresh, 24));
         assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
     }
+}
+
+/// A material that starts emitting in place lights the instances of the meshes that have it as a build lights them: a
+/// mesh of that material alone that two objects share, one of them movable (and moved afterwards: its new emitters
+/// follow it), a mesh of two materials of which the other emitted already (its instance's run of the light list
+/// grows), and a mesh added in place of a material nothing had. With and without a light tree. After each: no rebuild,
+/// the light list is its triangles, the weights and the picture are a build's. A material an instanced object has too
+/// rebuilds, one added in place as well.
+#[test]
+fn a_material_that_starts_emitting_lights_its_meshes_instances_as_a_build_does() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let late = |emissive: f32| serde_json::from_value(serde_json::json!({ "name": "late", "color": [0.2, 0.2, 0.2], "opacity": 1, "metalness": 0, "roughness": 1, "emissive": [1.0, 0.6, 0.3], "emissiveIntensity": emissive, "doubleSided": true })).unwrap();
+    for tree in [false, true] {
+        let mut w = world();
+        // (The sun away: the meshes will light the scene.)
+        w.set_visible(20, false).unwrap();
+        w.set_material(6, late(0.0));
+        // Sixteen quads in a row in one geometry, a group each, by turns of the lamp's material, which emits, and of
+        // the late one; the geometry has them out of the row's order (so that a mesh tree orders them its own way under
+        // software traversal).
+        let (mut positions, mut indices, mut groups) = (vec![], vec![], vec![]);
+        for q in 0..16u32 {
+            let x = -0.48 + 0.06 * ((q * 7) % 16) as f32;
+            positions.extend([x, -0.15, 0.0, x + 0.06, -0.15, 0.0, x + 0.06, 0.15, 0.0, x, 0.15, 0.0]);
+            indices.extend([0, 1, 2, 0, 2, 3].map(|i| 4 * q + i));
+            groups.push([6 * q, 6, q % 2]);
+        }
+        w.set_geometry(7, Geometry { positions, normals: [0.0, 0.0, 1.0].repeat(64), uvs: vec![0.0; 128], indices, groups, colors: vec![] }).unwrap();
+        let mesh = |geometry, material, materials| Kind::Mesh { geometry, material, own_blas: false, materials };
+        w.set_object(13, "one".into(), None, mesh(3, 6, vec![]), true, false).unwrap();
+        w.set_transform(13, Vec3::new(-0.6, -0.5, 0.8), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        w.set_object(33, "third".into(), None, mesh(3, 6, vec![]), true, false).unwrap();
+        w.set_transform(33, Vec3::new(-0.1, -0.1, 1.2), glam::Quat::from_rotation_y(-0.4), Vec3::ONE).unwrap();
+        w.set_object(14, "other".into(), None, mesh(3, 6, vec![]), true, true).unwrap();
+        w.set_transform(14, Vec3::new(0.5, -0.5, 0.9), glam::Quat::from_rotation_y(0.5), Vec3::ONE).unwrap();
+        w.set_object(15, "two".into(), None, mesh(7, 5, vec![5, 6]), true, false).unwrap();
+        w.set_transform(15, Vec3::new(0.0, 0.6, 0.7), glam::Quat::from_rotation_x(-0.3), Vec3::ONE).unwrap();
+        // A material a mesh has and an instanced object too, and one nothing has yet; a mesh the scene says it edits
+        // (room for one added in place).
+        w.set_material(7, late(0.0));
+        w.set_material(8, late(0.0));
+        w.set_material(9, late(0.0));
+        w.set_object(32, "nine".into(), None, mesh(3, 9, vec![]), true, false).unwrap();
+        w.set_transform(32, Vec3::new(-0.9, -0.1, 0.5), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        w.set_object(26, "both".into(), None, mesh(3, 7, vec![]), true, false).unwrap();
+        w.set_transform(26, Vec3::new(-0.9, 0.6, 0.6), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        w.set_object(27, "copies".into(), None, Kind::Instanced { geometry: 3, procedural: false, materials: vec![7], capacity: 1 }, true, false).unwrap();
+        w.set_instances(27, 1, Some(glam::Mat4::from_translation(Vec3::new(0.9, 0.6, 0.6)).to_cols_array().to_vec()), None, None).unwrap();
+        w.set_object(28, "own".into(), None, Kind::Mesh { geometry: 3, material: 1, own_blas: true, materials: vec![] }, true, false).unwrap();
+        w.set_transform(28, Vec3::new(0.9, -0.1, 0.4), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+        if tree {
+            strip(&mut w);
+        }
+        let mut live = match open(&w) {
+            Ok(c) => c,
+            Err(e) => return eprintln!("skipped: {e}"),
+        };
+        w.take_changes();
+        picture(&mut live, 4);
+        let with = if tree { "with" } else { "without" };
+        let mesh_of = |c: &LiveCore, id: u32| c.sc.instances[c.sc.tables.retained.instance(id).expect("a mesh is an instance").instance as usize].mesh;
+        assert_eq!(mesh_of(&live, 13), mesh_of(&live, 14), "the two objects share their mesh");
+        let two = mesh_of(&live, 15) as usize;
+        assert_eq!((live.sc.meshes[two].count, live.sc.meshes[two].emitters), (32, 16), "the mesh of two materials: one emits");
+        // (A third object of the shared mesh, hidden when the material starts: it has its emitters when it is shown.)
+        w.set_visible(33, false).unwrap();
+        assert!(!live.commit(&mut w).unwrap(), "a mesh hidden, {with} a light tree: in place ({:?})", live.fallback);
+        w.set_material(6, late(30.0));
+        let what = format!("a material started emitting in place, {with} a light tree");
+        assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        assert_eq!((live.sc.meshes[two].emitters, live.sc.meshes[mesh_of(&live, 13) as usize].emitters), (32, 2), "{what}: the meshes' emitters");
+        list_is_its_triangles(&what, &live);
+        let moving = |c: &LiveCore, id: u32| {
+            let r = c.sc.tables.retained.instance(id).unwrap().instance;
+            c.sc.tables.emitter_tris.iter().filter(|e| e.inst == r && e.area > 0.0).map(|e| e.moves).collect::<Vec<_>>()
+        };
+        assert_eq!((moving(&live, 13), moving(&live, 14)), (vec![false; 2], vec![true; 2]), "{what}: the movable one's emitters move");
+        lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
+        w.set_visible(33, true).unwrap();
+        let what = format!("a mesh hidden when its material started emitting, shown, {with} a light tree");
+        assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+        list_is_its_triangles(&what, &live);
+        lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
+        if live.g.hwrt {
+            w.set_object(29, "added".into(), None, Kind::Mesh { geometry: 3, material: 8, own_blas: true, materials: vec![] }, true, false).unwrap();
+            w.set_transform(29, Vec3::new(-0.2, 0.1, 1.0), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+            assert!(!live.commit(&mut w).unwrap(), "a mesh added, {with} a light tree: in place ({:?})", live.fallback);
+            w.set_material(8, late(20.0));
+            let what = format!("the material of a mesh added in place started emitting, {with} a light tree");
+            assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+            list_is_its_triangles(&what, &live);
+            lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
+        }
+        w.set_transform(14, Vec3::new(0.2, -0.3, 1.2), glam::Quat::from_rotation_z(0.6), Vec3::ONE).unwrap();
+        let what = format!("the movable one of them moved, {with} a light tree");
+        assert!(!(live.commit(&mut w).unwrap() && live.g.hwrt), "{what}: in place ({:?})", live.fallback);
+        list_is_its_triangles(&what, &live);
+        // (A moving emitter's centre is not kept on the CPU: the picture alone.)
+        forget(&mut live);
+        let (a, b) = (picture(&mut live, 64), picture(&mut open(&w).unwrap(), 64));
+        assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        // A material meshes had alone, until an instanced object of it is added in place: a rebuild from then on.
+        if live.g.hwrt {
+            w.set_object(31, "more".into(), None, Kind::Instanced { geometry: 3, procedural: false, materials: vec![9], capacity: 1 }, true, false).unwrap();
+            w.set_instances(31, 1, Some(glam::Mat4::from_translation(Vec3::new(0.4, 0.2, 1.1)).to_cols_array().to_vec()), None, None).unwrap();
+            assert!(!live.commit(&mut w).unwrap(), "an instanced object added, {with} a light tree: in place ({:?})", live.fallback);
+            w.set_material(9, late(30.0));
+            assert!(live.commit(&mut w).unwrap(), "a material an instanced object added in place has too started emitting, {with} a light tree: a rebuild");
+        }
+        // (Its copies' emitters are a build's to make.)
+        w.set_material(7, late(30.0));
+        assert!(live.commit(&mut w).unwrap(), "a material an instanced object has too started emitting, {with} a light tree: a rebuild");
+    }
+}
+
+/// A mesh hidden or shown by its `visible` is drawn and lit as a build draws it, in place: a still mesh, one that
+/// emits, one hidden when the scene was built, a group of two, a movable one moved while it was hidden. With and
+/// without a light tree. After each: no rebuild, the light list is its triangles, the weights and the picture are a
+/// build's. A mesh whose geometry changed while it was hidden is drawn again by a rebuild.
+#[test]
+fn meshes_hidden_and_shown_in_place_are_drawn_as_a_build_draws_them() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let quad = |s: f32| Geometry { positions: vec![-s, -s, 0.0, s, -s, 0.0, s, s, 0.0, -s, s, 0.0], normals: [0.0, 0.0, 1.0].repeat(4), uvs: vec![0.0; 8], indices: vec![0, 1, 2, 0, 2, 3], groups: vec![], colors: vec![] };
+    for tree in [false, true] {
+        let mut w = world();
+        let mesh = |geometry, material, own_blas| Kind::Mesh { geometry, material, own_blas, materials: vec![] };
+        let place = |w: &mut World, id: u32, name: &str, parent: Option<u32>, kind: Kind, movable: bool, at: [f32; 3]| {
+            w.set_object(id, name.into(), parent, kind, true, movable).unwrap();
+            w.set_transform(id, Vec3::from(at), glam::Quat::from_rotation_y(0.3), Vec3::ONE).unwrap();
+        };
+        // A lamp hidden at the build, a group of two panels, a movable panel, a mesh the scene edits (a geometry of
+        // its own).
+        place(&mut w, 13, "late", None, mesh(3, 5, false), false, [-0.6, 0.6, 1.2]);
+        // (Stretched: the area it has when it is shown is not its mesh's own.)
+        w.set_transform(13, Vec3::new(-0.6, 0.6, 1.2), glam::Quat::from_rotation_y(0.3), Vec3::new(1.6, 0.6, 1.0)).unwrap();
+        w.set_visible(13, false).unwrap();
+        w.set_object(14, "group".into(), None, Kind::Group, true, false).unwrap();
+        place(&mut w, 15, "a", Some(14), mesh(3, 1, false), false, [0.5, -0.5, 0.6]);
+        place(&mut w, 16, "b", Some(14), mesh(3, 1, false), false, [0.0, -0.6, 0.9]);
+        place(&mut w, 21, "mover", None, mesh(3, 1, false), true, [0.7, 0.5, 0.5]);
+        w.set_geometry(8, quad(0.2)).unwrap();
+        place(&mut w, 22, "own", None, mesh(8, 1, true), false, [-0.7, -0.5, 0.9]);
+        if tree {
+            strip(&mut w);
+        }
+        let mut live = match open(&w) {
+            Ok(c) => c,
+            Err(e) => return eprintln!("skipped: {e}"),
+        };
+        w.take_changes();
+        picture(&mut live, 4);
+        let with = if tree { "with" } else { "without" };
+        let hidden = |c: &LiveCore, id: u32| {
+            let i = &c.sc.instances[c.sc.tables.retained.instance(id).expect("a mesh is an instance").instance as usize];
+            (i.hidden, i.masked)
+        };
+        assert_eq!((hidden(&live, 13), hidden(&live, 12)), ((true, true), (false, false)), "a mesh hidden at the build is an instance no ray sees");
+        let emitters = |c: &LiveCore, id: u32| {
+            let (t, r) = (&c.sc.tables, c.sc.tables.retained.instance(id).unwrap().instance);
+            t.emitter_tris.iter().filter(|e| e.inst == r && e.area > 0.0).map(|e| (crate::emitter_power(e, &t.materials, &t.objects, t.stride) > 0.0, e.moves)).collect::<Vec<_>>()
+        };
+        assert_eq!((emitters(&live, 13), emitters(&live, 12)), (vec![(false, true); 2], vec![(true, false); 2]), "its emitters weigh nothing, and are the moving subtree's when it is shown");
+        type Edit = (&'static str, Box<dyn Fn(&mut World)>);
+        let show = |id: u32, on: bool| -> Box<dyn Fn(&mut World)> { Box::new(move |w| w.set_visible(id, on).unwrap()) };
+        let edits: Vec<Edit> = vec![
+            ("a panel hidden", show(11, false)),
+            ("the panel shown", show(11, true)),
+            ("the lamp hidden", show(12, false)),
+            ("the lamp shown", show(12, true)),
+            ("a lamp hidden at the build shown", show(13, true)),
+            ("that lamp hidden again", show(13, false)),
+            ("a group of two hidden", show(14, false)),
+            ("the group shown", show(14, true)),
+            ("a movable mesh hidden", show(21, false)),
+            ("the movable mesh moved while hidden", Box::new(|w| w.set_transform(21, Vec3::new(-0.1, 0.2, 1.3), glam::Quat::from_rotation_z(0.4), Vec3::ONE).unwrap())),
+            ("the movable mesh shown where it moved to", show(21, true)),
+        ];
+        for (what, edit) in &edits {
+            let what = format!("{what}, {with} a light tree");
+            edit(&mut w);
+            let rebuilt = live.commit(&mut w).unwrap();
+            // (Software traversal may rebuild for a move: the picture holds either way.)
+            assert!(!rebuilt || (!live.g.hwrt && what.contains("moved")), "{what}: in place ({:?})", live.fallback);
+            if live.sc.tables.emitter_tris.iter().any(|e| e.area > 0.0) {
+                list_is_its_triangles(&what, &live);
+            }
+            // (Where each instance stands, hidden or not: its record's too.)
+            for id in [11, 12, 13, 15, 16, 21] {
+                let r = live.sc.tables.retained.instance(id).unwrap().instance as usize;
+                let (at, rec) = (w.world_matrix(id), live.sc.gpu_instances[r].m);
+                assert!(live.sc.instances[r].world.abs_diff_eq(at, 1e-5), "{what}: object {id}'s instance stands where the object does");
+                let rows = at.transpose().to_cols_array();
+                assert!(rec.iter().flatten().zip(&rows[..12]).all(|(a, b)| (a - b).abs() <= 1e-5), "{what}: object {id}'s record stands where the object does");
+            }
+            lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
+        }
+        assert_eq!((hidden(&live, 13), hidden(&live, 11), hidden(&live, 21)), ((true, true), (false, false), (false, false)), "{with} a light tree: as the world has them");
+        // Its geometry changed while it was hidden: the instance an edit took out is no longer its own to show.
+        if live.g.hwrt {
+            w.set_visible(22, false).unwrap();
+            assert!(!live.commit(&mut w).unwrap(), "a mesh the scene edits hidden, {with} a light tree: in place ({:?})", live.fallback);
+            let its = live.sc.instances[live.sc.tables.retained.instance(22).unwrap().instance as usize].mesh;
+            w.set_geometry(8, quad(0.35)).unwrap();
+            assert!(!live.commit(&mut w).unwrap(), "its geometry changed while hidden, {with} a light tree: in place ({:?})", live.fallback);
+            assert_eq!(hidden(&live, 22), (true, false), "taken out by the edit");
+            assert_eq!(live.sc.edit.users.get(&its).copied().unwrap_or(0), 0, "and its mesh has no user left");
+            w.set_visible(22, true).unwrap();
+            assert!(live.commit(&mut w).unwrap(), "shown after its geometry changed, {with} a light tree: a rebuild");
+            let what = format!("a mesh shown after its geometry changed while hidden, {with} a light tree");
+            lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
+        }
+    }
+}
+
+/// A still mesh's first move is its instance's, in place, and it moves in place from then on: one that emits (its
+/// emitters are moving ones from now on), a plain one, a group of two, and a lamp built without size that is given
+/// one. With and without a light tree. After each: no rebuild, the light list is its triangles, the picture is a
+/// build's.
+#[test]
+fn a_still_mesh_moves_in_place_from_its_first_move() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    for tree in [false, true] {
+        let mut w = world();
+        let mesh = |geometry, material| Kind::Mesh { geometry, material, own_blas: false, materials: vec![] };
+        w.set_object(14, "group".into(), None, Kind::Group, true, false).unwrap();
+        for (id, at) in [(15, Vec3::new(0.5, -0.5, 0.6)), (16, Vec3::new(0.0, -0.6, 0.9))] {
+            w.set_object(id, format!("o{id}"), Some(14), mesh(3, 1), true, false).unwrap();
+            w.set_transform(id, at, glam::Quat::from_rotation_y(0.3), Vec3::ONE).unwrap();
+        }
+        // (A lamp built without size: an instance no ray sees, until it is given one.)
+        w.set_object(18, "seed".into(), None, mesh(3, 5), true, false).unwrap();
+        w.set_transform(18, Vec3::new(-0.7, -0.5, 1.1), glam::Quat::IDENTITY, Vec3::ZERO).unwrap();
+        if tree {
+            strip(&mut w);
+        }
+        let mut live = match open(&w) {
+            Ok(c) => c,
+            Err(e) => return eprintln!("skipped: {e}"),
+        };
+        w.take_changes();
+        picture(&mut live, 4);
+        let with = if tree { "with" } else { "without" };
+        let moves = |c: &LiveCore, id: u32| {
+            let i = c.sc.tables.retained.instance(id).expect("a mesh is an instance");
+            (i.moves, c.sc.tables.emitter_tris.iter().filter(|e| e.inst == i.instance && e.area > 0.0).map(|e| e.moves).collect::<Vec<_>>())
+        };
+        assert_eq!((moves(&live, 12), moves(&live, 11).0, moves(&live, 15).0), ((false, vec![false; 2]), false, false), "still meshes, as built");
+        let seed = &live.sc.instances[live.sc.tables.retained.instance(18).expect("a mesh without size is an instance").instance as usize];
+        assert!(seed.hidden && seed.masked && seed.world.determinant() != 0.0, "built without size: unseen, at a point");
+        type Edit = (&'static str, Box<dyn Fn(&mut World)>);
+        let to = |id: u32, at: [f32; 3], turn: f32| -> Box<dyn Fn(&mut World)> { Box::new(move |w| w.set_transform(id, Vec3::from(at), glam::Quat::from_rotation_z(turn), Vec3::ONE).unwrap()) };
+        let edits: Vec<Edit> = vec![
+            ("the still lamp moved", to(12, [0.3, 0.5, 1.3], 0.4)),
+            ("the lamp moved again", to(12, [-0.2, 0.4, 1.4], -0.2)),
+            ("a still panel moved", to(11, [-0.6, 0.2, 0.7], 0.3)),
+            ("a still group of two moved", to(14, [0.1, 0.15, 0.2], 0.2)),
+            ("the group moved again", to(14, [-0.1, 0.1, 0.1], 0.0)),
+            ("a lamp built without size given its size", to(18, [-0.7, -0.5, 1.1], 0.3)),
+        ];
+        for (what, edit) in &edits {
+            let what = format!("{what}, {with} a light tree");
+            edit(&mut w);
+            let builds = live.top_builds;
+            let rebuilt = live.commit(&mut w).unwrap();
+            // (Software traversal without units has no instance to move, and rebuilds: the picture holds either way.)
+            assert!(!(rebuilt && live.g.hwrt), "{what}: in place ({:?})", live.fallback);
+            assert_eq!(live.top_builds - builds, u32::from(!rebuilt), "{what}: one build above the triangles");
+            list_is_its_triangles(&what, &live);
+            forget(&mut live);
+            let (a, b) = (picture(&mut live, 64), picture(&mut open(&w).unwrap(), 64));
+            assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+        }
+        if live.g.hwrt {
+            assert_eq!((moves(&live, 12), moves(&live, 11).0, moves(&live, 15).0, moves(&live, 16).0), ((true, vec![true; 2]), true, true, true), "{with} a light tree: they move from now on");
+        }
+    }
+}
+
+/// Meshes the scene did not say it edits change in place as those it did: a geometry two of them use replaced (one
+/// emits), one re-created with another geometry, a movable one added and moved, a still one added and moved, the
+/// movable one hidden, moved and shown, one removed, a group of two removed.
+/// With and without a light tree. After each: no rebuild, the light list is its triangles, the weights and the picture
+/// are a build's. (Hardware traversal: its room for edits grows from nothing.)
+#[test]
+fn meshes_change_in_place_whether_or_not_the_scene_said_so() {
+    let presets = crate::default_presets_dir();
+    let open = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new("."), &presets, 96, 54));
+    let quad = |s: f32| Geometry { positions: vec![-s, -s, 0.0, s, -s, 0.0, s, s, 0.0, -s, s, 0.0], normals: [0.0, 0.0, 1.0].repeat(4), uvs: vec![0.0; 8], indices: vec![0, 1, 2, 0, 2, 3], groups: vec![], colors: vec![] };
+    for tree in [false, true] {
+        let mut w = world();
+        let mesh = |geometry, material| Kind::Mesh { geometry, material, own_blas: false, materials: vec![] };
+        w.set_object(14, "group".into(), None, Kind::Group, true, false).unwrap();
+        for (id, at) in [(15, Vec3::new(0.5, -0.5, 0.6)), (16, Vec3::new(0.0, -0.6, 0.9))] {
+            w.set_object(id, format!("o{id}"), Some(14), mesh(3, 1), true, false).unwrap();
+            w.set_transform(id, at, glam::Quat::from_rotation_y(0.3), Vec3::ONE).unwrap();
+        }
+        if tree {
+            strip(&mut w);
+        }
+        let mut live = match open(&w) {
+            Ok(c) if c.g.hwrt => c,
+            Ok(_) => return eprintln!("skipped: no hardware RT"),
+            Err(e) => return eprintln!("skipped: {e}"),
+        };
+        w.take_changes();
+        picture(&mut live, 4);
+        assert!(!live.sc.tables.retained.has_own_instances(), "the scene said of no mesh that it edits it");
+        type Edit = (&'static str, Box<dyn Fn(&mut World)>);
+        let edits: Vec<Edit> = vec![
+            ("a geometry two meshes use replaced", Box::new(move |w| w.set_geometry(3, quad(0.4)).unwrap())),
+            ("a mesh re-created with another geometry", Box::new(move |w| w.set_object(10, "wall".into(), None, mesh(3, 1), true, false).unwrap())),
+            (
+                "a movable mesh added",
+                Box::new(move |w| {
+                    w.set_object(13, "mover".into(), None, mesh(3, 1), true, true).unwrap();
+                    w.set_transform(13, Vec3::new(-0.7, 0.6, 0.8), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+                }),
+            ),
+            ("the added mesh moved", Box::new(|w| w.set_transform(13, Vec3::new(-0.3, 0.7, 1.0), glam::Quat::from_rotation_z(0.5), Vec3::ONE).unwrap())),
+            // (What an edit placed moves as what the build placed does: a still one from its first move, a hidden one
+            // while it is hidden.)
+            (
+                "a still mesh added",
+                Box::new(move |w| {
+                    w.set_object(18, "still".into(), None, mesh(3, 1), true, false).unwrap();
+                    w.set_transform(18, Vec3::new(0.7, 0.6, 0.6), glam::Quat::IDENTITY, Vec3::ONE).unwrap();
+                }),
+            ),
+            ("the still added mesh moved", Box::new(|w| w.set_transform(18, Vec3::new(0.6, 0.3, 0.9), glam::Quat::from_rotation_z(-0.3), Vec3::ONE).unwrap())),
+            ("the added movable mesh hidden", Box::new(|w| w.set_visible(13, false).unwrap())),
+            ("the added movable mesh moved while hidden", Box::new(|w| w.set_transform(13, Vec3::new(-0.6, 0.2, 1.2), glam::Quat::IDENTITY, Vec3::ONE).unwrap())),
+            ("the added movable mesh shown", Box::new(|w| w.set_visible(13, true).unwrap())),
+            (
+                "the lamp removed",
+                Box::new(|w| {
+                    w.remove(12);
+                }),
+            ),
+            (
+                "a group of two meshes removed",
+                Box::new(|w| {
+                    w.remove(14);
+                }),
+            ),
+        ];
+        for (what, edit) in &edits {
+            let what = format!("{what}, {} a light tree", if tree { "with" } else { "without" });
+            edit(&mut w);
+            assert!(!live.commit(&mut w).unwrap(), "{what}: in place ({:?})", live.fallback);
+            if live.sc.tables.emitter_tris.iter().any(|e| e.area > 0.0) {
+                list_is_its_triangles(&what, &live);
+            }
+            lit_as_a_build(&what, &mut live, &mut open(&w).unwrap());
+        }
+    }
+}
+
+/// A still model whose instance is all of it (tests/render/data/panel.glb: a grey quad and a quad that only emits) is
+/// hidden, shown, removed and moved in place as a mesh is. With and without a light tree. After each: no rebuild, the
+/// light list is its triangles, the picture is a build's (and the weights, until one has moved).
+#[test]
+fn a_still_model_is_hidden_removed_and_moved_in_place() {
+    let presets = crate::default_presets_dir();
+    let open_at_root = |w: &World| gpu::Gpu::new().and_then(|g| LiveCore::new(g, w, Path::new(".."), &presets, 96, 54));
+    let model = || Kind::Model { uri: "tests/render/data/panel.glb".into(), nodes: None, animation: None, functions: vec![] };
+    for tree in [false, true] {
+        let mut w = world();
+        // (The lamp away: the models' panels light the scene.)
+        w.set_visible(12, false).unwrap();
+        for (id, at) in [(30, Vec3::new(-0.6, -0.5, 0.6)), (31, Vec3::new(0.5, 0.4, 0.7)), (32, Vec3::new(0.0, 0.6, 0.5))] {
+            w.set_object(id, format!("m{id}"), None, model(), true, false).unwrap();
+            w.set_transform(id, at, glam::Quat::from_rotation_y(0.4), Vec3::splat(0.05)).unwrap();
+        }
+        if tree {
+            strip(&mut w);
+        }
+        let mut live = match open_at_root(&w) {
+            Ok(c) => c,
+            Err(e) => return eprintln!("skipped: {e}"),
+        };
+        w.take_changes();
+        picture(&mut live, 4);
+        let with = if tree { "with" } else { "without" };
+        if live.g.hwrt {
+            assert!(matches!(&live.sc.tables.retained.proxies[&30].draw, scene::Draw::Instance(i) if !i.moves && matches!(i.mesh, scene::MeshKind::Model)), "a still model's proxy has its instance");
+        }
+        type Edit = (&'static str, bool, Box<dyn Fn(&mut World)>);
+        let edits: Vec<Edit> = vec![
+            ("a still model hidden", true, Box::new(|w| w.set_visible(30, false).unwrap())),
+            ("the model shown", true, Box::new(|w| w.set_visible(30, true).unwrap())),
+            (
+                "a still model removed",
+                true,
+                Box::new(|w| {
+                    w.remove(32);
+                }),
+            ),
+            ("a still model moved", false, Box::new(|w| w.set_transform(31, Vec3::new(0.3, 0.2, 1.0), glam::Quat::from_rotation_y(-0.3), Vec3::splat(0.05)).unwrap())),
+            ("the model moved again", false, Box::new(|w| w.set_transform(31, Vec3::new(0.1, 0.3, 1.1), glam::Quat::from_rotation_z(0.3), Vec3::splat(0.05)).unwrap())),
+        ];
+        for (what, weights, edit) in &edits {
+            let what = format!("{what}, {with} a light tree");
+            edit(&mut w);
+            let rebuilt = live.commit(&mut w).unwrap();
+            assert!(!(rebuilt && live.g.hwrt), "{what}: in place ({:?})", live.fallback);
+            list_is_its_triangles(&what, &live);
+            let mut fresh = open_at_root(&w).unwrap();
+            if *weights {
+                lit_as_a_build(&what, &mut live, &mut fresh);
+            } else {
+                // (A moving emitter's centre is not kept on the CPU: the picture alone.)
+                forget(&mut live);
+                let (a, b) = (picture(&mut live, 64), picture(&mut fresh, 64));
+                assert!(apart(&a, &b) < 0.5, "{what}: the picture is {:.2} steps from a build's", apart(&a, &b));
+            }
+        }
+    }
+}
+
+/// A scene whose only volume is hidden has its media passes made when it is loaded: the frame that shows the volume
+/// compiles nothing (an idle fireball's first fire).
+#[test]
+fn a_hidden_volumes_passes_are_made_at_load() {
+    let presets = crate::default_presets_dir();
+    let mut w = world();
+    w.set_volume_fn("f", "o.extinction = 1.0;".into(), String::new());
+    w.set_object(40, "fog".into(), None, Kind::Volume { function: "f".into(), params: vec![], shape: 0, majorant: 1.0, g: 0.0, homogeneous: true, animated: false, grid: None }, true, false).unwrap();
+    w.set_visible(40, false).unwrap();
+    let mut live = match gpu::Gpu::new().and_then(|g| LiveCore::new(g, &w, Path::new("."), &presets, 96, 54)) {
+        Ok(c) => c,
+        Err(e) => return eprintln!("skipped: {e}"),
+    };
+    w.take_changes();
+    assert!(live.sc.up.kernel.features & gpu::F_MEDIA != 0, "a hidden volume is the scene's medium");
+    let made = |c: &LiveCore| {
+        let mut v: Vec<&'static str> = c.g.kernel_passes_made().into_iter().filter(|e| e.starts_with("media")).collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(made(&live), ["media_composite", "media_train"], "made when the scene was loaded");
+    picture(&mut live, 2);
+    w.set_visible(40, true).unwrap();
+    assert!(!live.commit(&mut w).unwrap(), "shown in place ({:?})", live.fallback);
+    picture(&mut live, 2);
+    assert_eq!(made(&live), ["media_composite", "media_train"], "the frame that shows it makes none");
 }
 
 #[test]

@@ -217,6 +217,7 @@ pub(super) fn load_scene(g: &gpu::Gpu, world: &World, assets: &Path, presets: &P
     // (THREERT_EDIT_REBUILD=1: every edit rebuilds, a material that starts emitting too: the A/B.)
     tables.emit_in_place = std::env::var("THREERT_EDIT_REBUILD").map_or(true, |v| v != "1");
     tables.fixed_mats = std::mem::take(&mut prep.fixed_mats);
+    tables.mesh_mats = std::mem::take(&mut prep.mesh_mats);
     let emit = EmitterWorker::new(&tables, &g.device);
     tables.defer_powers = emit.is_some();
     let (mat_runs, tri_order) = (std::mem::take(&mut prep.mat_runs), std::mem::take(&mut prep.tri_order));
@@ -226,6 +227,12 @@ pub(super) fn load_scene(g: &gpu::Gpu, world: &World, assets: &Path, presets: &P
     let _ = g.pipeline(&up.kernel, true); // compile the scene's kernel variant now, not in the first frame
     if !g.merged {
         let _ = g.kernel_pass(&up.kernel, "finish");
+    }
+    // (And the media passes where the scene has a medium, shown or hidden: the frame that first shows one, an idle
+    // fireball's first fire, would otherwise wait for them.)
+    if up.kernel.features & gpu::F_MEDIA != 0 {
+        let _ = g.kernel_pass(&up.kernel, "media_train");
+        let _ = g.kernel_pass(&up.kernel, "media_composite");
     }
     let env = Environment {
         sky: SkyState { map: (prep.env.width, prep.env.height), altitude: sc.camera.position.y.max(0.0), floor: prep.env_nee_floor, cover: sc.environment.cloud_cover, worker: None },

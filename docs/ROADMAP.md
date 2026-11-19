@@ -2730,6 +2730,48 @@ geometric normal through a function on a mirrored mesh, vertex colours on one (e
 traversal); the flattening of an instance against the build's flattening, mirrored too; a mirrored model's build; a
 copy mirrored in place; an emitting instanced object added, changed and removed in place against a build.
 
+**Meshes are edited in place (2026-11-18, scene step E, second part).** With every mesh an instance, what the
+scene does to one is a change of its instance, not a rebuild. Hidden or shown (itself, or a group above it): the
+instance's mask; a hidden mesh is built as an instance no ray sees, its row without power (`Instance::masked`,
+`show_meshes`). A still mesh's first move: its instance moves from then on, and one that emits has its emitters as
+moving ones, a new run of the light list (`Changes::started`, `start_moving`). Its geometry changed, the mesh
+re-created or removed, a group of meshes removed, a movable mesh added: in place whether or not the scene said it
+edits the mesh (`world::edits_in_place`; `dynamicGeometry` now only keeps room for it at the build). A placement
+without size is an unseen instance everywhere: built so, moved so, a posed rigid model's node too. A still model
+whose instance is all of it is hidden, moved and removed the same way (`whole`).
+Still a rebuild: a mesh of several materials changed or added; a mesh shown after its geometry changed while it was
+hidden; a model hidden when the scene was built, or with triangles flattened beside its instance; an animated model's
+first move; a hidden mesh under software traversal without units.
+Tests, each against a build's light list, weights and picture: meshes hidden and shown (still, emitting, hidden at
+the build, a group, moved while hidden); a still mesh's first move (emitting, plain, a group, one built without
+size); meshes changed without the scene's word (a shared geometry, a re-creation, a movable one added, removals); a
+still model hidden, removed and moved. `volume/grid-rebuild-live` rebuilds by adding a group.
+
+**A mesh is an instance of its geometry's mesh (2026-11-18, scene step E, first part).** A mesh was an instance
+only where scene code asked (`dynamicGeometry`) or a body drove it; every other one was flattened into the
+still scene's world-space groups, a movable one re-transformed on the CPU at each move. Now every shown mesh with a
+size is an instance: its triangles once in model space in the pool, one BLAS, shared by the objects of the same
+geometry and materials. A mesh of several materials (a geometry group each) is one mesh, its triangles ordered by
+class, a BLAS geometry a class (`scene::own_mesh`). A movable mesh's move is its instance's transform
+(`InstanceRef::moves`): no vertex is written again, and under software traversal it moves in place too. A material
+that starts emitting gives each instance of its meshes its emitters in place (`Tables::mesh_mats`, live/edits.rs
+`add_material_emitters`: the mesh's emitting triangles numbered again, a new run of the light list an instance, the
+old one at no weight); one a model or an instanced object has too still rebuilds. Room for edits in place stays
+where the scene said a mesh is edited or driven (`Retained::edits_meshes`).
+A moved instance whose placement has no size (scene code hides by scaling to 0) stands at a point, hidden, and
+comes back in place (`scene::placed_world`, as an instanced object's copy does).
+Still flattened: a mesh without size, `THREERT_INSTANCING=0`, a light's card, particles, triangles on the same
+vertices (`flatten_coincident`), deforming meshes. Still a rebuild, the next part: hiding a mesh, a still mesh's
+first move, removing or changing the geometry of one the scene did not say it edits.
+Not the common structure, a step of its own after this one: a mesh is shared by geometry and materials, the
+material being a triangle's attribute (two objects of one geometry with different materials hold its triangles
+twice); the common one has the material on the instance.
+Tests: a mesh of three materials whose geometry has the glass first (`shadow/glass-groups`, `-frame`, `-cutout`,
+`-live-exact`); a several-material mesh's order and counts; a material that starts emitting, against a build (a
+shared mesh, a movable one moved after, a mesh of two materials one of which emitted already, a mesh added in
+place; one an instanced object has too rebuilds); a movable mesh scaled to nothing and back. Under software
+traversal `wind/pivot-sway-live` passes now.
+
 **Glass is a part of its mesh (2026-11-18).** The last reason to flatten a material's triangles at every placement
 goes. A mesh's glass is a geometry of its BLAS beside the opaque and the cutout one, the only one not flagged opaque
 (`InstMesh::parts`; a hit's triangle from its geometry and primitive by two starts in the instance's record). A shadow
